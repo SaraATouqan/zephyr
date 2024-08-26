@@ -1,0 +1,16 @@
+# Copyright (c) 2024 Your Company
+#
+# SPDX-License-Identifier: Apache-2.0
+ 
+DT_COMPAT_STM32_I3C := st,stm32-i3c
+module = I3C_STM32
+module-str = i3c_stm32
+
+source "subsys/logging/Kconfig.template.log_config"
+config I3C_STM32
+    bool "STM32 I3C driver support"
+    depends on DT_HAS_ST_STM32_I3C_ENABLED
+    select USE_STM32_HAL_I3C
+    default y
+    help
+      Enable support for I3C on STM32 microcontrollers.
