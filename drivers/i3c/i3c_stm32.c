@@ -105,7 +105,6 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
     LL_I3C_ConfigClockWaveForm(i3c, 0x00550908);
     LL_I3C_SetCtrlBusCharacteristic(i3c, 0x102f00ee);
     LL_I3C_EnableHJAck(i3c);
-
     /* Configure FIFO */
     LL_I3C_SetRxFIFOThreshold(i3c, LL_I3C_RXFIFO_THRESHOLD_1_4);
     LL_I3C_SetTxFIFOThreshold(i3c, LL_I3C_TXFIFO_THRESHOLD_1_4);
@@ -182,13 +181,12 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
     }
 
     /* Start CCC transfer */
-    LL_I3C_ControllerHandleCCC(i3c, payload->ccc.id, payload->ccc.data_len,
-                   (i3c_ccc_is_payload_broadcast(payload)
-                        ? LL_I3C_GENERATE_STOP
-                        : LL_I3C_GENERATE_RESTART));
+    LL_I3C_ControllerHandleCCC(
+        i3c, payload->ccc.id, payload->ccc.data_len,
+        (i3c_ccc_is_payload_broadcast(payload) ? LL_I3C_GENERATE_STOP : LL_I3C_GENERATE_RESTART));
 
     /* Wait for CCC to complete */
-    if (k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+    if(k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
         return -ETIMEDOUT;
     }
 
@@ -523,6 +521,7 @@ static void i3c_stm32_event_isr(void *arg)
         /* Mark bus as idle after each frame complete */
         data->msg_state = STM32_I3C_MSG_IDLE;
     }
+
 #ifdef CONFIG_I3C_USE_IBI
     if (LL_I3C_IsActiveFlag_IBI(i3c)) {
         /* Clear frame complete flag */
