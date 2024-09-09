@@ -10,6 +10,9 @@
 #include <stm32h5xx_ll_system.h>
 #include <stm32h5xx_ll_cortex.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <zephyr/pm/policy.h>
+#include <zephyr/pm/device.h>
+#include <zephyr/pm/device_runtime.h>
 #include <zephyr/drivers/clock_control/stm32_clock_control.h>
 #include <zephyr/logging/log.h>
 
@@ -210,6 +213,12 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
         return -EINVAL;
     }
 
+    #ifdef CONFIG_PM_DEVICE_RUNTIME
+        (void)pm_device_runtime_get(dev);
+    #endif
+    /* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
     /* Mark current transfer as CCC */
     data->msg_state = STM32_I3C_MSG_CCC;
     data->ccc_payload = payload;
@@ -248,6 +257,12 @@ static int i3c_stm32_do_daa(const struct device *dev)
     struct i3c_stm32_data *data = dev->data;
     I3C_TypeDef *i3c = config->i3c;
 
+    #ifdef CONFIG_PM_DEVICE_RUNTIME
+        (void)pm_device_runtime_get(dev);
+    #endif
+    /* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
     /* Mark current transfer as DAA */
     data->msg_state = STM32_I3C_MSG_DAA;
 
@@ -280,6 +295,12 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
         if (msgs[i].buf == NULL) {
             continue;
         }
+
+        #ifdef CONFIG_PM_DEVICE_RUNTIME
+	        (void)pm_device_runtime_get(dev);
+        #endif
+	    /* Prevent the clocks to be stopped during the transaction */
+	    pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
         data->msg = &msgs[i];
 
@@ -318,6 +339,12 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
             continue;
         }
 
+        #ifdef CONFIG_PM_DEVICE_RUNTIME
+            (void)pm_device_runtime_get(dev);
+        #endif
+        /* Prevent the clocks to be stopped during the transaction */
+	    pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
         data->i2c_msg = &msgs[i];
 
         if ((data->i2c_msg->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ) {
@@ -348,6 +375,51 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
     return 0;
 }
 
+#ifdef CONFIG_PM_DEVICE
+static int i3c_stm32_suspend(const struct device *dev)
+{
+	int ret;
+	const struct i3c_stm32_config *cfg = dev->config;
+	const struct device *const clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
+
+	/* Disable device clock. */
+	ret = clock_control_off(clk, (clock_control_subsys_t)&cfg->pclken[0]);
+	if (ret < 0) {
+		LOG_ERR("failure disabling I3C clock");
+		return ret;
+	}
+
+	/* Move pins to sleep state */
+	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_SLEEP);
+	if (ret == -ENOENT) {
+		/* Warn but don't block suspend */
+		LOG_WRN("I3C pinctrl sleep state not available ");
+	} else if (ret < 0) {
+		return ret;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	int err;
+
+	switch (action) {
+	case PM_DEVICE_ACTION_RESUME:
+		err = i3c_stm32_activate(dev);
+		break;
+	case PM_DEVICE_ACTION_SUSPEND:
+		err = i3c_stm32_suspend(dev);
+		break;
+	default:
+		return -ENOTSUP;
+	}
+
+	return err;
+}
+#endif
+
 /* Initializes the I3C device and I3C bus */
 static int i3c_stm32_init(const struct device *dev)
 {
@@ -360,6 +432,10 @@ static int i3c_stm32_init(const struct device *dev)
     config->irq_config_func(dev);
 
     i3c_stm32_configure(dev, I3C_CONFIG_CONTROLLER, NULL);
+
+    #ifdef CONFIG_PM_DEVICE_RUNTIME
+        (void)pm_device_runtime_enable(dev);
+    #endif
 
     /* Start by doing a RSTDAA */
     struct i3c_ccc_payload rstdaa_ccc_payload = {0};
@@ -387,7 +463,7 @@ static void i3c_stm32_event_tx_write(const struct device *dev)
     struct i3c_stm32_data *data = dev->data;
     I3C_TypeDef *i3c = config->i3c;
 
-    if (data->msg_state == STM32_I3C_MSG_READ) {
+    if (data->msg_state == STM32_I3C_MSG_WRITE) {
         struct i3c_msg *msg = data->msg;
 
         if (msg->num_xfer < msg->len) {
@@ -668,6 +744,11 @@ static void i3c_stm32_event_isr(void *arg)
         LL_I3C_ClearFlag_FC(i3c);
         k_sem_give(&data->bus_mutex);
 
+        #ifdef CONFIG_PM_DEVICE_RUNTIME
+	        (void)pm_device_runtime_put(dev);
+        #endif
+        pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
         /* Mark bus as idle after each frame complete */
         data->msg_state = STM32_I3C_MSG_IDLE;
     }
@@ -761,6 +842,11 @@ static void i3c_stm32_error_isr(void *arg)
     data->msg_state = STM32_I3C_MSG_ERR;
 
     k_sem_give(&data->bus_mutex);
+
+    #ifdef CONFIG_PM_DEVICE_RUNTIME
+	    (void)pm_device_runtime_put(dev);
+    #endif
+    pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 }
 
 static const struct i3c_driver_api i3c_stm32_driver_api = {
@@ -817,8 +903,10 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
     };                                                                                         \
                                                                                                    \
     static struct i3c_stm32_data i3c_stm32_data_##index;                                       \
-                                                                                                   \
-    DEVICE_DT_INST_DEFINE(index, &i3c_stm32_init, NULL, &i3c_stm32_data_##index,               \
+                                                                                                \
+    PM_DEVICE_DT_INST_DEFINE(index, i3c_stm32_pm_action);  		                                \
+                                                                                                \
+    DEVICE_DT_INST_DEFINE(index, &i3c_stm32_init, PM_DEVICE_DT_INST_GET(index), &i3c_stm32_data_##index,               \
                   &i3c_stm32_cfg_##index, POST_KERNEL, CONFIG_I3C_INIT_PRIORITY,       \
                   &i3c_stm32_driver_api);                                              \
                                                                                                    \
