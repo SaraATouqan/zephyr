@@ -74,9 +74,11 @@ struct i3c_stm32_data {
     uint64_t pid;               /* Current DAA target PID */
     size_t daa_rx_rcv;          /* Number of RX bytes received during DAA */
     uint8_t target_id;          /* Target id */
-    uint32_t ibi_payload;       /* Received ibi payload */
-    uint32_t ibi_payload_size;  /* Received payload size */
-    uint32_t ibi_target_addr;   /* Received target dynamic address */
+#ifdef CONFIG_I3C_USE_IBI
+    uint32_t ibi_payload;      /* Received ibi payload */
+    uint32_t ibi_payload_size; /* Received payload size */
+    uint32_t ibi_target_addr;  /* Received target dynamic address */
+#endif
 };
 
 /* Activates the device I3C pinctrl and CLK */
@@ -258,7 +260,10 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
     }
 
     LL_I3C_SetCtrlBusCharacteristic(i3c, 0x10630077);
+
+#ifdef CONFIG_I3C_USE_IBI
     LL_I3C_EnableHJAck(i3c);
+#endif
 
     /* Configure FIFO */
     LL_I3C_SetRxFIFOThreshold(i3c, LL_I3C_RXFIFO_THRESHOLD_1_4);
@@ -283,8 +288,10 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
     LL_I3C_EnableIT_RXFNE(i3c);
     LL_I3C_EnableIT_TXFNF(i3c);
     LL_I3C_EnableIT_ERR(i3c);
+#ifdef CONFIG_I3C_USE_IBI
     LL_I3C_EnableIT_IBI(i3c);
     LL_I3C_EnableIT_HJ(i3c);
+#endif
 
     /* Bus will be idle initially */
     data->msg_state = STM32_I3C_MSG_IDLE;
@@ -515,7 +522,7 @@ static int i3c_stm32_suspend(const struct device *dev)
     ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_SLEEP);
     if (ret == -ENOENT) {
         /* Warn but don't block suspend */
-        LOG_WRN("I3C pinctrl sleep state not available ");
+        LOG_WRN("I3C pinctrl sleep state not available");
     } else if (ret < 0) {
         return ret;
     }
