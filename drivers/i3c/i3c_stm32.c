@@ -66,14 +66,15 @@ struct i3c_stm32_data {
     struct i3c_ccc_target_payload *
         ccc_target_payload; /* Current target addressed by 2nd part of direct CCC command */
     size_t ccc_target_idx;      /* Current target index, used for filling C-FIFO */
-    struct k_sem bus_mutex;     /* Sync between device communication messages */
-    struct i3c_msg *msg;        /* Current private message */
-    uint8_t target_addr;        /* Current target xfer address */
-    struct i2c_msg *i2c_msg;    /* Current I2C legacy message */
-    size_t i2c_msg_idx;         /* Current I2C legacy message transfer index */
-    uint64_t pid;               /* Current DAA target PID */
-    size_t daa_rx_rcv;          /* Number of RX bytes received during DAA */
-    uint8_t target_id;          /* Target id */
+    struct k_sem device_sync_sem; /* Sync between device communication messages */
+    struct k_sem bus_mutex;       /* Sync between transfers */
+    struct i3c_msg *msg;          /* Current private message */
+    uint8_t target_addr;          /* Current target xfer address */
+    struct i2c_msg *i2c_msg;      /* Current I2C legacy message */
+    size_t i2c_msg_idx;           /* Current I2C legacy message transfer index */
+    uint64_t pid;                 /* Current DAA target PID */
+    size_t daa_rx_rcv;            /* Number of RX bytes received during DAA */
+    uint8_t target_id;            /* Target id */
 #ifdef CONFIG_I3C_USE_IBI
     uint32_t ibi_payload;      /* Received ibi payload */
     uint32_t ibi_payload_size; /* Received payload size */
@@ -367,7 +368,7 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
                         : LL_I3C_GENERATE_RESTART));
 
     /* Wait for CCC to complete */
-    if (k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+    if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
         return -ETIMEDOUT;
     }
 
@@ -403,7 +404,7 @@ static int i3c_stm32_do_daa(const struct device *dev)
     LL_I3C_ControllerHandleCCC(i3c, I3C_CCC_ENTDAA, 0, LL_I3C_GENERATE_STOP);
 
     /* Wait for DAA to finish */
-    if (k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+    if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
         return -ETIMEDOUT;
     }
 
@@ -425,6 +426,8 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
     const struct i3c_stm32_config *config = dev->config;
     I3C_TypeDef *i3c = config->i3c;
     data->target_addr = target->dynamic_addr;
+
+    k_sem_take(&data->bus_mutex, K_FOREVER);
 
     for (size_t i = 0; i < num_msgs; i++) {
         if (msgs[i].buf == NULL) {
@@ -448,15 +451,18 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
         LL_I3C_RequestTransfer(i3c);
 
         /* Wait for current transfer to complete */
-        if (k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+        if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
             return -ETIMEDOUT;
         }
 
         if (data->msg_state == STM32_I3C_MSG_ERR) {
             i3c_stm32_clear_err(dev);
+            k_sem_give(&data->bus_mutex);
             return -EIO;
         }
     }
+
+    k_sem_give(&data->bus_mutex);
 
     return 0;
 }
@@ -468,6 +474,11 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
     const struct i3c_stm32_config *config = dev->config;
     I3C_TypeDef *i3c = config->i3c;
     data->target_addr = addr;
+
+    k_sem_take(&data->bus_mutex, K_FOREVER);
+
+    /* Disable arbitration header for all I2C messages */
+    LL_I3C_DisableArbitrationHeader(i3c);
 
     for (size_t i = 0; i < num_msgs; i++) {
         if (msgs[i].buf == NULL) {
@@ -490,22 +501,23 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 
         data->i2c_msg_idx = 0;
 
-        LL_I3C_DisableArbitrationHeader(i3c);
-
         LL_I3C_RequestTransfer(i3c);
 
         /* Wait for current transfer to complete */
-        if (k_sem_take(&data->bus_mutex, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+        if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
             return -ETIMEDOUT;
         }
 
-        LL_I3C_EnableArbitrationHeader(i3c);
-
         if (data->msg_state == STM32_I3C_MSG_ERR) {
             i3c_stm32_clear_err(dev);
+            LL_I3C_EnableArbitrationHeader(i3c);
+            k_sem_give(&data->bus_mutex);
             return -EIO;
         }
     }
+
+    LL_I3C_EnableArbitrationHeader(i3c);
+    k_sem_give(&data->bus_mutex);
 
     return 0;
 }
@@ -562,7 +574,13 @@ static int i3c_stm32_init(const struct device *dev)
     struct i3c_stm32_data *data = dev->data;
     int ret;
 
-    k_sem_init(&data->bus_mutex, 0, K_SEM_MAX_LIMIT);
+    k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
+
+    /* initialize mutex used when multiple transfers
+     * are taking place to guarantee that each one is
+     * atomic and has exclusive access to the I3C bus.
+     */
+    k_sem_init(&data->bus_mutex, 1, 1);
 
     config->irq_config_func(dev);
 
@@ -873,7 +891,7 @@ static void i3c_stm32_event_isr(void *arg)
     /* Frame complete handler */
     if (LL_I3C_IsActiveFlag_FC(i3c) && LL_I3C_IsEnabledIT_FC(i3c)) {
         LL_I3C_ClearFlag_FC(i3c);
-        k_sem_give(&data->bus_mutex);
+        k_sem_give(&data->device_sync_sem);
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
         (void)pm_device_runtime_put(dev);
@@ -972,7 +990,7 @@ static void i3c_stm32_error_isr(void *arg)
 
     data->msg_state = STM32_I3C_MSG_ERR;
 
-    k_sem_give(&data->bus_mutex);
+    k_sem_give(&data->device_sync_sem);
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
     (void)pm_device_runtime_put(dev);
