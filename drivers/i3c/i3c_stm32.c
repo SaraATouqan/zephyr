@@ -395,6 +395,10 @@ static int i3c_stm32_do_daa(const struct device *dev)
     /* Mark current transfer as DAA */
     data->msg_state = STM32_I3C_MSG_DAA;
 
+    /* Disable TXFNF interrupt, the RXFNE interrupt will enable it once all PID bytes are
+     * received */
+    LL_I3C_DisableIT_TXFNF(i3c);
+
     /* Start DAA */
     LL_I3C_ControllerHandleCCC(i3c, I3C_CCC_ENTDAA, 0, LL_I3C_GENERATE_STOP);
 
@@ -405,6 +409,8 @@ static int i3c_stm32_do_daa(const struct device *dev)
 
     if (data->msg_state == STM32_I3C_MSG_ERR) {
         i3c_stm32_clear_err(dev);
+        /* Enable TXFNF interrupt in case an error occured before it was enabled by RXFNE */
+        LL_I3C_EnableIT_TXFNF(i3c);
         return -EIO;
     }
 
@@ -615,11 +621,6 @@ static void i3c_stm32_event_tx_daa(const struct device *dev)
     struct i3c_stm32_data *data = dev->data;
     I3C_TypeDef *i3c = config->i3c;
 
-    /* Not all PID bytes arrived, wait until they arrive */
-    if (data->daa_rx_rcv != 8) {
-        return;
-    }
-
     struct i3c_device_desc *target;
     uint8_t bcr;
     uint8_t dcr;
@@ -730,16 +731,17 @@ static void i3c_stm32_event_rx_daa(const struct device *dev)
     struct i3c_stm32_data *data = dev->data;
     I3C_TypeDef *i3c = config->i3c;
 
-    /* When RXFNF flag is set and we already received 8 bytes from DAA, it means that we are
-     * currently working with a new target */
-    if (data->daa_rx_rcv == 8) {
-        data->daa_rx_rcv = 0;
-    }
-
     data->pid <<= 8;
     data->pid |= LL_I3C_ReceiveData8(i3c);
 
     data->daa_rx_rcv++;
+
+    /* After receiving 8 PID bytes from DAA, enable TXFNF interrupt to send the dynamic address
+     */
+    if (data->daa_rx_rcv == 8) {
+        LL_I3C_EnableIT_TXFNF(i3c);
+        data->daa_rx_rcv = 0;
+    }
 }
 
 /* Handles the RX 2nd part of direct CCC */
