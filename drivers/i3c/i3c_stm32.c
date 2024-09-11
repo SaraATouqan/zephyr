@@ -31,6 +31,10 @@ LOG_MODULE_REGISTER(i3c_stm32, CONFIG_I3C_LOG_LEVEL);
 #define STM32_I3C_SCLL_PP_MIN_NS  32ull
 #define STM32_I3C_SCLH_I3C_MIN_NS 32ull
 
+#define STM32_I3C_TBUF_FMP_MIN_NS 500.0
+#define STM32_I3C_TBUF_FM_MIN_NS 1300.0
+#define STM32_I3C_TCAS_MIN_NS 38.4
+
 #define STM32_I3C_TRANSFER_TIMEOUT K_MSEC(100)
 
 /* Integer divison with ceiling */
@@ -223,6 +227,47 @@ static int i3c_stm32_config_clk_wave(const struct device *dev)
 	return 0;
 }
 
+static int i3c_stm32_config_ctrl_bus_char(const struct device *dev)
+{
+	const struct i3c_stm32_config *cfg = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	const struct device *clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
+	I3C_TypeDef *i3c = cfg->i3c;
+	uint32_t i3c_clock = 0;
+	uint32_t i2c_bus_freq = data->drv_data.ctrl_config.scl.i2c;
+
+	uint8_t free = 0;
+	uint8_t aval = 0;
+
+	if (clock_control_get_rate(clk, (clock_control_subsys_t)&cfg->pclken[0], &i3c_clock) < 0) {
+		LOG_ERR("Failed call clock_control_get_rate(pclken[0])");
+		return -EIO;
+	}
+
+	/* Satisfying I3C start timing min timing will statisfy the rest of the conditions */
+	if (i2c_bus_freq > 400000) {
+		/* Mixed bus with I2C FM+ device */
+		free = (uint8_t) ceil((STM32_I3C_TBUF_FMP_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+	} else if (i2c_bus_freq > 0) {
+		/* Mixed bus with I2C FM device */
+		free = (uint8_t) ceil((STM32_I3C_TBUF_FM_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+	} else {
+		/* Pure I3C bus */
+		free = (uint8_t) ceil((STM32_I3C_TCAS_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+	}
+
+	aval = INT_DIV_CEIL(1000ull * i3c_clock, 1000000000ull) - 1;
+
+	LL_I3C_SetDataHoldTime(i3c, LL_I3C_SDA_HOLD_TIME_1_5);
+	LL_I3C_SetFreeTiming(i3c, free);
+	LL_I3C_SetControllerActivityState(i3c, LL_I3C_OWN_ACTIVITY_STATE_0);
+	LL_I3C_SetAvalTiming(i3c, aval);
+
+	LOG_DBG("TimingReg1 = 0x%08x", LL_I3C_GetCtrlBusCharacteristic(i3c));
+
+	return 0;
+}
+
 /* Configures the I3C module in controller mode */
 static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type type, void *cfg)
 {
@@ -262,7 +307,11 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 		return ret;
 	}
 
-	LL_I3C_SetCtrlBusCharacteristic(i3c, 0x10630077);
+	ret = i3c_stm32_config_ctrl_bus_char(dev);
+	if (ret != 0) {
+		LOG_ERR("TimingReg1 timing could not be calculated, err=%d", ret);
+		return ret;
+	}
 
 #ifdef CONFIG_I3C_USE_IBI
 	LL_I3C_EnableHJAck(i3c);
