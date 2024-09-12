@@ -226,6 +226,29 @@ static int i3c_stm32_config_clk_wave(const struct device *dev)
 
 	return 0;
 }
+/**
+ * @brief Get current configuration of the I3C hardware.
+ *
+ * @param[in] dev Pointer to controller device driver instance.
+ * @param[in] type Type of configuration.
+ * @param[in,out] config Pointer to the configuration parameters.
+ *
+ * @retval 0 If successful.
+ * @retval -EIO General Input/Output errors.
+ * @retval -ENOSYS If not implemented.
+ */
+static int i3c_stm32_config_get(const struct device *dev, enum i3c_config_type type, void *config)
+{
+	struct i3c_stm32_data *data = dev->data;
+
+	if ((type != I3C_CONFIG_CONTROLLER) || (config == NULL)) {
+		return -EINVAL;
+	}
+
+	(void)memcpy(config, &data->drv_data.ctrl_config, sizeof(data->drv_data.ctrl_config));
+
+	return 0;
+}
 
 static int i3c_stm32_config_ctrl_bus_char(const struct device *dev)
 {
@@ -1056,6 +1079,7 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.i2c_api.configure = i3c_stm32_i2c_configure,
 	.i2c_api.transfer = i3c_stm32_i2c_transfer,
 	.configure = i3c_stm32_configure,
+	.config_get = i3c_stm32_config_get,
 	.i3c_xfers = i3c_stm32_transfer,
 	.do_daa = i3c_stm32_do_daa,
 	.do_ccc = i3c_stm32_do_ccc,
