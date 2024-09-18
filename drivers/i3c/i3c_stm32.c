@@ -32,8 +32,8 @@ LOG_MODULE_REGISTER(i3c_stm32, CONFIG_I3C_LOG_LEVEL);
 #define STM32_I3C_SCLH_I3C_MIN_NS 32ull
 
 #define STM32_I3C_TBUF_FMP_MIN_NS 500.0
-#define STM32_I3C_TBUF_FM_MIN_NS 1300.0
-#define STM32_I3C_TCAS_MIN_NS 38.4
+#define STM32_I3C_TBUF_FM_MIN_NS  1300.0
+#define STM32_I3C_TCAS_MIN_NS     38.4
 
 #define STM32_I3C_TRANSFER_TIMEOUT K_MSEC(100)
 
@@ -270,13 +270,13 @@ static int i3c_stm32_config_ctrl_bus_char(const struct device *dev)
 	/* Satisfying I3C start timing min timing will statisfy the rest of the conditions */
 	if (i2c_bus_freq > 400000) {
 		/* Mixed bus with I2C FM+ device */
-		free = (uint8_t) ceil((STM32_I3C_TBUF_FMP_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+		free = (uint8_t)ceil((STM32_I3C_TBUF_FMP_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
 	} else if (i2c_bus_freq > 0) {
 		/* Mixed bus with I2C FM device */
-		free = (uint8_t) ceil((STM32_I3C_TBUF_FM_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+		free = (uint8_t)ceil((STM32_I3C_TBUF_FM_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
 	} else {
 		/* Pure I3C bus */
-		free = (uint8_t) ceil((STM32_I3C_TCAS_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
+		free = (uint8_t)ceil((STM32_I3C_TCAS_MIN_NS * i3c_clock / 1e9 - 0.5) / 2);
 	}
 
 	aval = INT_DIV_CEIL(1000ull * i3c_clock, 1000000000ull) - 1;
@@ -465,7 +465,9 @@ static int i3c_stm32_do_daa(const struct device *dev)
 	/* Mark current transfer as DAA */
 	data->msg_state = STM32_I3C_MSG_DAA;
 
-	/* Disable TXFNF interrupt, the RXFNE interrupt will enable it once all PID bytes are received */
+	/* Disable TXFNF interrupt, the RXFNE interrupt will enable it once all PID bytes are
+	 * received
+	 */
 	LL_I3C_DisableIT_TXFNF(i3c);
 
 	/* Start DAA */
@@ -676,236 +678,222 @@ static int i3c_stm32_init(const struct device *dev)
 	return 0;
 }
 
-/* Handles the TX part of private write */
-static void i3c_stm32_event_tx_write(const struct device *dev)
+static void i3c_stm32_event_isr_tx(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (data->msg_state == STM32_I3C_MSG_WRITE) {
+	switch (data->msg_state) {
+	case STM32_I3C_MSG_WRITE: {
 		struct i3c_msg *msg = data->msg;
 
 		if (msg->num_xfer < msg->len) {
 			LL_I3C_TransmitData8(i3c, msg->buf[msg->num_xfer++]);
 		}
-	} else {
-		/* I2C Legacy message */
+		break;
+	}
+	case STM32_I2C_MSG_WRITE: {
 		struct i2c_msg *msg = data->i2c_msg;
 
 		if (data->i2c_msg_idx < msg->len) {
 			LL_I3C_TransmitData8(i3c, msg->buf[data->i2c_msg_idx++]);
 		}
+		break;
 	}
-}
+	case STM32_I3C_MSG_DAA: {
+		struct i3c_device_desc *target;
+		uint8_t bcr;
+		uint8_t dcr;
+		uint8_t dyn_addr = 0;
+		int ret;
 
-/* Handles the TX part of the ENTDAA CCC */
-static void i3c_stm32_event_tx_daa(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
+		bcr = (data->pid >> 8) & 0xFF;
+		dcr = data->pid & 0xFF;
+		data->pid >>= 16;
 
-	struct i3c_device_desc *target;
-	uint8_t bcr;
-	uint8_t dcr;
-	uint8_t dyn_addr = 0;
-	int ret;
+		/* Find the device in the device list */
+		ret = i3c_dev_list_daa_addr_helper(&data->drv_data.attached_dev.addr_slots,
+						   &config->drv_cfg.dev_list, data->pid, false,
+						   false, &target, &dyn_addr);
+		if (ret != 0) {
+			/* TODO: figure out what is the correct sequence to exit form this error
+			 * It is expected that a TX overrun error to occur which triggers err isr
+			 */
+			LOG_ERR("No dynamic address could be assigned to target");
 
-	bcr = (data->pid >> 8) & 0xFF;
-	dcr = data->pid & 0xFF;
-	data->pid >>= 16;
-
-	/* Find the device in the device list */
-	ret = i3c_dev_list_daa_addr_helper(&data->drv_data.attached_dev.addr_slots,
-					   &config->drv_cfg.dev_list, data->pid, false, false,
-					   &target, &dyn_addr);
-	if (ret != 0) {
-		/* TODO: figure out what is the correct sequence to exit form this error
-		 * It is expected that a TX overrun error to occur which triggers err isr
-		 */
-		LOG_ERR("No dynamic address could be assigned to target");
-
-		return;
-	}
-
-	/* Put the new dynamic address in TX FIFO for transmission */
-	LL_I3C_TransmitData8(i3c, dyn_addr);
-
-	if (target != NULL) {
-		/* Update target descriptor */
-		target->dynamic_addr = dyn_addr;
-		target->bcr = bcr;
-		target->dcr = dcr;
-	}
-
-	/* Mark the address as used */
-	i3c_addr_slots_mark_i3c(&data->drv_data.attached_dev.addr_slots, dyn_addr);
-
-	/* Mark the static address as free */
-	if ((target != NULL) && (target->static_addr != 0) && (dyn_addr != target->static_addr)) {
-		i3c_addr_slots_mark_free(&data->drv_data.attached_dev.addr_slots, dyn_addr);
-	}
-
-	/* Set I3C bus devices configuration */
-#ifdef CONFIG_I3C_USE_IBI
-	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
-		(((bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
-		LL_I3C_ConfigDeviceCapabilities(
-			i3c, (++data->target_id), dyn_addr, LL_I3C_GET_IBI_CAPABLE(bcr),
-			LL_I3C_GET_IBI_PAYLOAD(bcr), LL_I3C_GET_CR_CAPABLE(bcr));
-	}
-#endif
-}
-
-/* Handles the TX part of CCC */
-static void i3c_stm32_event_tx_ccc(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
-	struct i3c_ccc_payload *payload = data->ccc_payload;
-
-	if (payload->ccc.num_xfer < payload->ccc.data_len) {
-		LL_I3C_TransmitData8(i3c, payload->ccc.data[payload->ccc.num_xfer++]);
-	}
-}
-
-/* Handles the TX 2nd part of direct CCC */
-static void i3c_stm32_event_tx_ccc_p2(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
-	struct i3c_ccc_target_payload *target = data->ccc_target_payload;
-
-	if (target->num_xfer < target->data_len) {
-		LL_I3C_TransmitData8(i3c, target->data[target->num_xfer++]);
-
-		/* After sending all bytes for current target, move on to the next target */
-		if (target->num_xfer == target->data_len) {
-			data->ccc_target_payload++;
+			return;
 		}
+
+		/* Put the new dynamic address in TX FIFO for transmission */
+		LL_I3C_TransmitData8(i3c, dyn_addr);
+
+		if (target != NULL) {
+			/* Update target descriptor */
+			target->dynamic_addr = dyn_addr;
+			target->bcr = bcr;
+			target->dcr = dcr;
+		}
+
+		/* Mark the address as used */
+		i3c_addr_slots_mark_i3c(&data->drv_data.attached_dev.addr_slots, dyn_addr);
+
+		/* Mark the static address as free */
+		if ((target != NULL) && (target->static_addr != 0) &&
+			(dyn_addr != target->static_addr)) {
+			i3c_addr_slots_mark_free(&data->drv_data.attached_dev.addr_slots, dyn_addr);
+		}
+
+		/* Set I3C bus devices configuration */
+#ifdef CONFIG_I3C_USE_IBI
+		if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
+			(((bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
+			LL_I3C_ConfigDeviceCapabilities(
+				i3c, (++data->target_id), dyn_addr, LL_I3C_GET_IBI_CAPABLE(bcr),
+				LL_I3C_GET_IBI_PAYLOAD(bcr), LL_I3C_GET_CR_CAPABLE(bcr));
+		}
+#endif
+		break;
+	}
+	case STM32_I3C_MSG_CCC: {
+		struct i3c_ccc_payload *payload = data->ccc_payload;
+
+		if (payload->ccc.num_xfer < payload->ccc.data_len) {
+			LL_I3C_TransmitData8(i3c, payload->ccc.data[payload->ccc.num_xfer++]);
+		}
+		break;
+	}
+	case STM32_I3C_MSG_CCC_P2: {
+		struct i3c_ccc_target_payload *target = data->ccc_target_payload;
+
+		if (target->num_xfer < target->data_len) {
+			LL_I3C_TransmitData8(i3c, target->data[target->num_xfer++]);
+
+			/* After sending all bytes for current target, move on to the next target */
+			if (target->num_xfer == target->data_len) {
+				data->ccc_target_payload++;
+			}
+		}
+		break;
+	}
+	default:
+		break;
 	}
 }
 
-/* Handles the RX part of private read */
-static void i3c_stm32_event_rx_read(const struct device *dev)
+static void i3c_stm32_event_isr_rx(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (data->msg_state == STM32_I3C_MSG_READ) {
+	switch (data->msg_state) {
+	case STM32_I3C_MSG_READ: {
 		struct i3c_msg *msg = data->msg;
 
 		if (msg->num_xfer < msg->len) {
 			msg->buf[msg->num_xfer++] = LL_I3C_ReceiveData8(i3c);
 		}
-	} else {
+		break;
+	}
+	case STM32_I2C_MSG_READ: {
 		struct i2c_msg *msg = data->i2c_msg;
 
 		if (data->i2c_msg_idx < msg->len) {
 			msg->buf[data->i2c_msg_idx++] = LL_I3C_ReceiveData8(i3c);
 		}
+		break;
 	}
-}
+	case STM32_I3C_MSG_DAA: {
+		data->pid <<= 8;
+		data->pid |= LL_I3C_ReceiveData8(i3c);
 
-/* Handles the RX part of ENTDAA CCC */
-static void i3c_stm32_event_rx_daa(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
+		data->daa_rx_rcv++;
 
-	data->pid <<= 8;
-	data->pid |= LL_I3C_ReceiveData8(i3c);
-
-	data->daa_rx_rcv++;
-
-	/* After receiving 8 PID bytes from DAA, enable TXFNF interrupt to send the dynamic address
-	 */
-	if (data->daa_rx_rcv == 8) {
-		LL_I3C_EnableIT_TXFNF(i3c);
-		data->daa_rx_rcv = 0;
-	}
-}
-
-/* Handles the RX 2nd part of direct CCC */
-static void i3c_stm32_event_rx_ccc_p2(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
-	struct i3c_ccc_target_payload *target = data->ccc_target_payload;
-
-	if (target->num_xfer < target->data_len) {
-		target->data[target->num_xfer++] = LL_I3C_ReceiveData8(i3c);
-
-		/* After receiving all bytes for current target, move on to the next target */
-		if (target->num_xfer == target->data_len) {
-			data->ccc_target_payload++;
+		/* After receiving 8 PID bytes from DAA, enable TXFNF interrupt to send the dynamic
+		 * address
+		 */
+		if (data->daa_rx_rcv == 8) {
+			LL_I3C_EnableIT_TXFNF(i3c);
+			data->daa_rx_rcv = 0;
 		}
+		break;
+	}
+	case STM32_I3C_MSG_CCC_P2: {
+		struct i3c_ccc_target_payload *target = data->ccc_target_payload;
+
+		if (target->num_xfer < target->data_len) {
+			target->data[target->num_xfer++] = LL_I3C_ReceiveData8(i3c);
+
+			/* After receiving all bytes for current target, move on to the next target
+			 */
+			if (target->num_xfer == target->data_len) {
+				data->ccc_target_payload++;
+			}
+		}
+		break;
+	}
+	default:
+		break;
 	}
 }
 
-/* Handles the CF part of private transfer */
-static void i3c_stm32_event_cf(const struct device *dev)
+static void i3c_stm32_event_isr_cf(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
 
-	uint32_t direction;
-	uint32_t message_type;
-	uint32_t msg_len;
-
-	if (data->msg_state == STM32_I2C_MSG_READ || data->msg_state == STM32_I2C_MSG_WRITE) {
-		message_type = LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C;
-		if ((data->i2c_msg->flags & I2C_MSG_RW_MASK) == I2C_MSG_WRITE) {
-			direction = LL_I3C_DIRECTION_WRITE;
-		} else {
-			direction = LL_I3C_DIRECTION_READ;
-		}
-		msg_len = data->i2c_msg->len;
-	} else {
-		message_type = LL_I3C_CONTROLLER_MTYPE_PRIVATE;
-		if ((data->msg->flags & I3C_MSG_RW_MASK) == I3C_MSG_WRITE) {
-			direction = LL_I3C_DIRECTION_WRITE;
-		} else {
-			direction = LL_I3C_DIRECTION_READ;
-		}
-		msg_len = data->msg->len;
-	}
-
-	LL_I3C_ControllerHandleMessage(i3c, data->target_addr, msg_len, direction, message_type,
-					   LL_I3C_GENERATE_STOP);
-}
-
-/* Handles the CF part of direct CCC */
-static void i3c_stm_event_cf_ccc(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	struct i3c_stm32_data *data = dev->data;
-	I3C_TypeDef *i3c = config->i3c;
-	struct i3c_ccc_payload *payload = data->ccc_payload;
-	struct i3c_ccc_target_payload *target;
-
-	if (data->ccc_target_idx < payload->targets.num_targets) {
-		target = &payload->targets.payloads[data->ccc_target_idx++];
-
+	switch (data->msg_state) {
+	case STM32_I3C_MSG_READ: {
 		LL_I3C_ControllerHandleMessage(
-			i3c, target->addr, target->data_len,
-			target->rnw ? LL_I3C_DIRECTION_READ : LL_I3C_DIRECTION_WRITE,
-			LL_I3C_CONTROLLER_MTYPE_DIRECT,
-			(data->ccc_target_idx == payload->targets.num_targets)
-				? LL_I3C_GENERATE_STOP
-				: LL_I3C_GENERATE_RESTART);
+			i3c, data->target_addr, data->msg->len, LL_I3C_DIRECTION_READ,
+			LL_I3C_CONTROLLER_MTYPE_PRIVATE, LL_I3C_GENERATE_STOP);
+		break;
+	}
+	case STM32_I3C_MSG_WRITE: {
+		LL_I3C_ControllerHandleMessage(
+			i3c, data->target_addr, data->msg->len, LL_I3C_DIRECTION_WRITE,
+			LL_I3C_CONTROLLER_MTYPE_PRIVATE, LL_I3C_GENERATE_STOP);
+		break;
+	}
+	case STM32_I2C_MSG_READ: {
+		LL_I3C_ControllerHandleMessage(
+			i3c, data->target_addr, data->i2c_msg->len, LL_I3C_DIRECTION_READ,
+			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C, LL_I3C_GENERATE_STOP);
+		break;
+	}
+	case STM32_I2C_MSG_WRITE: {
+		LL_I3C_ControllerHandleMessage(
+			i3c, data->target_addr, data->i2c_msg->len, LL_I3C_DIRECTION_WRITE,
+			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C, LL_I3C_GENERATE_STOP);
+		break;
+	}
+	case STM32_I3C_MSG_CCC:
+	case STM32_I3C_MSG_CCC_P2: {
+		struct i3c_ccc_payload *payload = data->ccc_payload;
+		struct i3c_ccc_target_payload *target;
 
-		/* Change state to second part of CCC communication */
-		if (data->msg_state == STM32_I3C_MSG_CCC) {
-			data->msg_state = STM32_I3C_MSG_CCC_P2;
+		if (data->ccc_target_idx < payload->targets.num_targets) {
+			target = &payload->targets.payloads[data->ccc_target_idx++];
+
+			LL_I3C_ControllerHandleMessage(
+				i3c, target->addr, target->data_len,
+				target->rnw ? LL_I3C_DIRECTION_READ : LL_I3C_DIRECTION_WRITE,
+				LL_I3C_CONTROLLER_MTYPE_DIRECT,
+				(data->ccc_target_idx == payload->targets.num_targets)
+					? LL_I3C_GENERATE_STOP
+					: LL_I3C_GENERATE_RESTART);
+
+			/* Change state to second part of CCC communication */
+			if (data->msg_state == STM32_I3C_MSG_CCC) {
+				data->msg_state = STM32_I3C_MSG_CCC_P2;
+			}
 		}
+		break;
+	}
+	default:
+		break;
 	}
 }
 
@@ -920,41 +908,17 @@ static void i3c_stm32_event_isr(void *arg)
 
 	/* TX FIFO not full handler */
 	if (LL_I3C_IsActiveFlag_TXFNF(i3c) && LL_I3C_IsEnabledIT_TXFNF(i3c)) {
-		if (data->msg_state == STM32_I3C_MSG_WRITE ||
-			data->msg_state == STM32_I2C_MSG_WRITE) {
-			i3c_stm32_event_tx_write(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_DAA) {
-			i3c_stm32_event_tx_daa(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_CCC) {
-			i3c_stm32_event_tx_ccc(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_CCC_P2) {
-			i3c_stm32_event_tx_ccc_p2(dev);
-		}
+		i3c_stm32_event_isr_tx(dev);
 	}
 
 	/* RX FIFO not empty handler */
 	if (LL_I3C_IsActiveFlag_RXFNE(i3c) && LL_I3C_IsEnabledIT_RXFNE(i3c)) {
-		if (data->msg_state == STM32_I3C_MSG_READ ||
-			data->msg_state == STM32_I2C_MSG_READ) {
-			i3c_stm32_event_rx_read(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_DAA) {
-			i3c_stm32_event_rx_daa(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_CCC_P2) {
-			i3c_stm32_event_rx_ccc_p2(dev);
-		}
+		i3c_stm32_event_isr_rx(dev);
 	}
 
 	/* Control FIFO not full handler */
 	if (LL_I3C_IsActiveFlag_CFNF(i3c) && LL_I3C_IsEnabledIT_CFNF(i3c)) {
-		if (data->msg_state == STM32_I3C_MSG_READ ||
-			data->msg_state == STM32_I3C_MSG_WRITE ||
-			data->msg_state == STM32_I2C_MSG_READ ||
-			data->msg_state == STM32_I2C_MSG_WRITE) {
-			i3c_stm32_event_cf(dev);
-		} else if (data->msg_state == STM32_I3C_MSG_CCC ||
-			   data->msg_state == STM32_I3C_MSG_CCC_P2) {
-			i3c_stm_event_cf_ccc(dev);
-		}
+		i3c_stm32_event_isr_cf(dev);
 	}
 
 	if (LL_I3C_IsActiveFlag_SFNE(i3c) && LL_I3C_IsEnabledIT_SFNE(i3c)) {
