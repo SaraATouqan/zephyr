@@ -386,6 +386,26 @@ static int i3c_stm32_i2c_configure(const struct device *dev, uint32_t config)
 	return 0;
 }
 
+/**
+ * @brief Find a registered I3C target device.
+ *
+ * This returns the I3C device descriptor of the I3C device
+ * matching the incoming @p id.
+ *
+ * @param dev Pointer to controller device driver instance.
+ * @param id Pointer to I3C device ID.
+ *
+ * @return @see i3c_device_find.
+ */
+static struct i3c_device_desc *i3c_stm32_device_find(const struct device *dev,
+						    const struct i3c_device_id *id)
+{
+	const struct i3c_stm32_config *config = dev->config;
+
+	return i3c_dev_list_find(&config->drv_cfg.dev_list, id);
+
+}
+
 /* Handles broadcast/direct CCCs except for ENTDAA */
 static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *payload)
 {
@@ -1044,6 +1064,7 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.i2c_api.transfer = i3c_stm32_i2c_transfer,
 	.configure = i3c_stm32_configure,
 	.config_get = i3c_stm32_config_get,
+	.i3c_device_find = i3c_stm32_device_find,
 	.i3c_xfers = i3c_stm32_transfer,
 	.do_daa = i3c_stm32_do_daa,
 	.do_ccc = i3c_stm32_do_ccc,
