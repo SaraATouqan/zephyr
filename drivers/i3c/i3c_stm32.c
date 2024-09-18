@@ -311,12 +311,6 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 		return ret;
 	}
 
-	ret = i3c_addr_slots_init(dev);
-	if (ret != 0) {
-		LOG_ERR("Addr slots init fail, err=%d", ret);
-		return ret;
-	}
-
 	/* I3C Initialization */
 	LL_I3C_SetMode(i3c, LL_I3C_MODE_CONTROLLER);
 	LL_I3C_SetDataHoldTime(i3c, LL_I3C_SDA_HOLD_TIME_1_5);
@@ -344,7 +338,7 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 	LL_I3C_SetRxFIFOThreshold(i3c, LL_I3C_RXFIFO_THRESHOLD_1_4);
 	LL_I3C_SetTxFIFOThreshold(i3c, LL_I3C_TXFIFO_THRESHOLD_1_4);
 	LL_I3C_EnableControlFIFO(i3c);
-	LL_I3C_DisableStatusFIFO(i3c);
+	LL_I3C_EnableStatusFIFO(i3c);
 
 	/* Configure Controller */
 	LL_I3C_SetOwnDynamicAddress(i3c, 0);
@@ -360,6 +354,7 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 
 	LL_I3C_EnableIT_FC(i3c);
 	LL_I3C_EnableIT_CFNF(i3c);
+	LL_I3C_EnableIT_SFNE(i3c);
 	LL_I3C_EnableIT_RXFNE(i3c);
 	LL_I3C_EnableIT_TXFNF(i3c);
 	LL_I3C_EnableIT_ERR(i3c);
@@ -442,6 +437,7 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
 
 	/* Wait for CCC to complete */
 	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+		i3c_stm32_clear_err(dev);
 		return -ETIMEDOUT;
 	}
 
@@ -657,6 +653,12 @@ static int i3c_stm32_init(const struct device *dev)
 	 */
 	k_sem_init(&data->bus_mutex, 1, 1);
 
+	ret = i3c_addr_slots_init(dev);
+	if (ret != 0) {
+		LOG_ERR("Addr slots init fail, err=%d", ret);
+		return ret;
+	}
+
 	config->irq_config_func(dev);
 
 	i3c_stm32_configure(dev, I3C_CONFIG_CONTROLLER, NULL);
@@ -665,20 +667,9 @@ static int i3c_stm32_init(const struct device *dev)
 	(void)pm_device_runtime_enable(dev);
 #endif
 
-	/* Start by doing a RSTDAA */
-	struct i3c_ccc_payload rstdaa_ccc_payload = {0};
-
-	rstdaa_ccc_payload.ccc.id = I3C_CCC_RSTDAA;
-
-	ret = i3c_stm32_do_ccc(dev, &rstdaa_ccc_payload);
+	ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
 	if (ret != 0) {
-		LOG_ERR("Failed to do CCC RSTDAA, err=%d", ret);
-		return ret;
-	}
-
-	ret = i3c_stm32_do_daa(dev);
-	if (ret != 0) {
-		LOG_ERR("Failed to do ENTDAA, err=%d", ret);
+		LOG_ERR("Failed to do i3c bus init, err=%d", ret);
 		return ret;
 	}
 
@@ -757,12 +748,14 @@ static void i3c_stm32_event_tx_daa(const struct device *dev)
 	}
 
 	/* Set I3C bus devices configuration */
+#ifdef CONFIG_I3C_USE_IBI
 	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
 		(((bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
 		LL_I3C_ConfigDeviceCapabilities(
 			i3c, (++data->target_id), dyn_addr, LL_I3C_GET_IBI_CAPABLE(bcr),
 			LL_I3C_GET_IBI_PAYLOAD(bcr), LL_I3C_GET_CR_CAPABLE(bcr));
 	}
+#endif
 }
 
 /* Handles the TX part of CCC */
@@ -964,6 +957,13 @@ static void i3c_stm32_event_isr(void *arg)
 		}
 	}
 
+	if (LL_I3C_IsActiveFlag_SFNE(i3c) && LL_I3C_IsEnabledIT_SFNE(i3c)) {
+		/* Will be read and discarded since there's no real use for it */
+		uint32_t status_reg = i3c->SR;
+
+		ARG_UNUSED(status_reg);
+	}
+
 	/* Frame complete handler */
 	if (LL_I3C_IsActiveFlag_FC(i3c) && LL_I3C_IsEnabledIT_FC(i3c)) {
 		LL_I3C_ClearFlag_FC(i3c);
@@ -1035,11 +1035,11 @@ static void i3c_stm32_error_isr(void *arg)
 	}
 
 	if (LL_I3C_IsActiveFlag_COVR(i3c)) {
-		LOG_ERR("Control FIFO overrun");
+		LOG_ERR("Control/Status FIFO underrun/overrun");
 	}
 
 	if (LL_I3C_IsActiveFlag_DOVR(i3c)) {
-		LOG_ERR("TX/RX FIFO overrun");
+		LOG_ERR("TX/RX FIFO underrun/overrun");
 	}
 
 	if (LL_I3C_IsActiveFlag_DNACK(i3c)) {
