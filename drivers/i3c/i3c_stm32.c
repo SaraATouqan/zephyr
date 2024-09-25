@@ -358,6 +358,7 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 	LL_I3C_EnableIT_RXFNE(i3c);
 	LL_I3C_EnableIT_TXFNF(i3c);
 	LL_I3C_EnableIT_ERR(i3c);
+	LL_I3C_EnableIT_WKP(i3c);
 #ifdef CONFIG_I3C_USE_IBI
 	LL_I3C_EnableIT_IBI(i3c);
 	LL_I3C_EnableIT_HJ(i3c);
@@ -976,14 +977,16 @@ static void i3c_stm32_event_isr(void *arg)
 			LOG_INF("IBI done, payload received :%d,%d,%d\n", data->ibi_payload,
 				data->ibi_payload_size, data->ibi_target_addr);
 			struct i3c_device_desc *target = NULL;
+			if ((data->ibi_payload != 0) && (data->ibi_payload_size != 0)) {
+				target = i3c_dev_list_i3c_addr_find(&data->drv_data.attached_dev,
+									data->ibi_target_addr);
 
-			target = i3c_dev_list_i3c_addr_find(&data->drv_data.attached_dev,
-								data->ibi_target_addr);
-			if (target != NULL) {
-				if (i3c_ibi_work_enqueue_target_irq(target,
+				if (target != NULL) {
+					if (i3c_ibi_work_enqueue_target_irq(target,
 									(uint8_t *)&data->ibi_payload,
 									data->ibi_payload_size) != 0) {
-					LOG_ERR("Error enqueue IBI IRQ work");
+						LOG_ERR("Error enqueue IBI IRQ work");
+					}
 				} else {
 					LOG_ERR("IBI from unknown device addr 0x%x",
 						data->ibi_target_addr);
@@ -1003,6 +1006,10 @@ static void i3c_stm32_event_isr(void *arg)
 		}
 	}
 #endif
+
+	if (LL_I3C_IsActiveFlag_WKP(I3C1)) {
+		LL_I3C_ClearFlag_WKP(I3C1);
+	}
 }
 
 /* Handles the I3C error ISR */
