@@ -46,10 +46,8 @@ enum i3c_stm32_msg_state {
 	STM32_I3C_MSG_DAA,    /* Dynamic addressing state */
 	STM32_I3C_MSG_CCC,    /* First part of CCC command state*/
 	STM32_I3C_MSG_CCC_P2, /* Second part of CCC command state (used for direct commands)*/
-	STM32_I3C_MSG_WRITE,  /* Private write state */
-	STM32_I3C_MSG_READ,   /* Private read state */
-	STM32_I2C_MSG_WRITE,  /* I2C legacy write state */
-	STM32_I2C_MSG_READ,   /* I2C legacy read state */
+	STM32_I3C_MSG,        /* Private msg state */
+	STM32_I2C_MSG,        /* I2C legacy msg state */
 	STM32_I3C_MSG_IDLE,   /* Idle bus state */
 	STM32_I3C_MSG_ERR,    /* Error state */
 	STM32_I3C_MSG_INVAL,  /* Invalid state */
@@ -72,13 +70,20 @@ struct i3c_stm32_data {
 	size_t ccc_target_idx;      /* Current target index, used for filling C-FIFO */
 	struct k_sem device_sync_sem; /* Sync between device communication messages */
 	struct k_sem bus_mutex;       /* Sync between transfers */
-	struct i3c_msg *msg;          /* Current private message */
 	uint8_t target_addr;          /* Current target xfer address */
-	struct i2c_msg *i2c_msg;      /* Current I2C legacy message */
-	size_t i2c_msg_idx;           /* Current I2C legacy message transfer index */
-	uint64_t pid;                 /* Current DAA target PID */
-	size_t daa_rx_rcv;            /* Number of RX bytes received during DAA */
-	uint8_t target_id;            /* Target id */
+	struct i3c_msg
+		*current_i3c_msg; /* Pointer to the current private message to send on the bus */
+	struct i3c_msg *current_i3c_msg_cf; /* Pointer to the private messagethat will be used by
+						   the control FIFO */
+	struct i2c_msg
+		*current_i2c_msg; /* Pointer to the current legacy message to send on the bus */
+	struct i2c_msg *current_i2c_msg_cf; /* Pointer to the I2C legavy message that will be used
+						   by the control FIFO */
+	size_t current_i2c_msg_idx;         /* Current I2C legacy message transfer index */
+	uint8_t num_msgs;                   /* Number of messages to send on bus */
+	uint64_t pid;                       /* Current DAA target PID */
+	size_t daa_rx_rcv;                  /* Number of RX bytes received during DAA */
+	uint8_t target_id;                  /* Target id */
 #ifdef CONFIG_I3C_USE_IBI
 	uint32_t ibi_payload;      /* Received ibi payload */
 	uint32_t ibi_payload_size; /* Received payload size */
@@ -522,42 +527,40 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
-	data->target_addr = target->dynamic_addr;
+	/* Verify all messages */
+	for (size_t i = 0; i < num_msgs; i++) {
+		if (msgs[i].buf == NULL) {
+			return -EINVAL;
+		}
+	}
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 
-	for (size_t i = 0; i < num_msgs; i++) {
-		if (msgs[i].buf == NULL) {
-
-			continue;
-		}
+	data->msg_state = STM32_I3C_MSG;
+	data->target_addr = target->dynamic_addr;
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
-		(void)pm_device_runtime_get(dev);
+	(void)pm_device_runtime_get(dev);
 #endif
-		/* Prevent the clocks to be stopped during the transaction */
-		pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
-		data->msg = &msgs[i];
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
-		if ((data->msg->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ) {
-			data->msg_state = STM32_I3C_MSG_READ;
-		} else {
-			data->msg_state = STM32_I3C_MSG_WRITE;
-		}
+	data->current_i3c_msg_cf = &msgs[0];
+	data->current_i3c_msg = &msgs[0];
+	data->num_msgs = num_msgs;
 
-		LL_I3C_RequestTransfer(i3c);
+	LL_I3C_RequestTransfer(i3c);
 
-		/* Wait for current transfer to complete */
-		if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-			return -ETIMEDOUT;
-		}
+	/* Wait for whole transfer to complete */
+	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+		return -ETIMEDOUT;
+	}
 
-		if (data->msg_state == STM32_I3C_MSG_ERR) {
-			i3c_stm32_clear_err(dev);
-			k_sem_give(&data->bus_mutex);
-			return -EIO;
-		}
+	if (data->msg_state == STM32_I3C_MSG_ERR) {
+		i3c_stm32_clear_err(dev);
+		k_sem_give(&data->bus_mutex);
+		return -EIO;
 	}
 
 	k_sem_give(&data->bus_mutex);
@@ -572,50 +575,55 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
-	data->target_addr = addr;
+	if (addr > 0xff) {
+		LOG_ERR("This device only supports 7-bit addressing mode");
+		return -EINVAL;
+	}
 
-	k_sem_take(&data->bus_mutex, K_FOREVER);
-
-	/* Disable arbitration header for all I2C messages */
-	LL_I3C_DisableArbitrationHeader(i3c);
-
+	/* Verify all messages */
 	for (size_t i = 0; i < num_msgs; i++) {
 		if (msgs[i].buf == NULL) {
-			continue;
-		}
-
-#ifdef CONFIG_PM_DEVICE_RUNTIME
-		(void)pm_device_runtime_get(dev);
-#endif
-		/* Prevent the clocks to be stopped during the transaction */
-		pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-
-		data->i2c_msg = &msgs[i];
-
-		if ((data->i2c_msg->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ) {
-			data->msg_state = STM32_I2C_MSG_READ;
-		} else {
-			data->msg_state = STM32_I2C_MSG_WRITE;
-		}
-
-		data->i2c_msg_idx = 0;
-
-		LL_I3C_RequestTransfer(i3c);
-
-		/* Wait for current transfer to complete */
-		if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-			return -ETIMEDOUT;
-		}
-
-		if (data->msg_state == STM32_I3C_MSG_ERR) {
-			i3c_stm32_clear_err(dev);
-			LL_I3C_EnableArbitrationHeader(i3c);
-			k_sem_give(&data->bus_mutex);
-			return -EIO;
+			return -EINVAL;
 		}
 	}
 
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+
+	data->msg_state = STM32_I2C_MSG;
+	data->target_addr = addr;
+
+	/* Disable arbitration header for all I2C messages in case no I3C devices exist on bus */
+	LL_I3C_DisableArbitrationHeader(i3c);
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	(void)pm_device_runtime_get(dev);
+#endif
+
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
+	data->current_i2c_msg_cf = &msgs[0];
+	data->current_i2c_msg = &msgs[0];
+	data->current_i2c_msg_idx = 0;
+	data->num_msgs = num_msgs;
+
+	LL_I3C_RequestTransfer(i3c);
+
+	/* Wait for current transfer to complete */
+	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+		LL_I3C_EnableArbitrationHeader(i3c);
+		return -ETIMEDOUT;
+	}
+
+	if (data->msg_state == STM32_I3C_MSG_ERR) {
+		i3c_stm32_clear_err(dev);
+		LL_I3C_EnableArbitrationHeader(i3c);
+		k_sem_give(&data->bus_mutex);
+		return -EIO;
+	}
+
 	LL_I3C_EnableArbitrationHeader(i3c);
+
 	k_sem_give(&data->bus_mutex);
 
 	return 0;
@@ -698,11 +706,11 @@ static int i3c_stm32_init(const struct device *dev)
 	(void)pm_device_runtime_enable(dev);
 #endif
 
-	ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
-	if (ret != 0) {
-		LOG_ERR("Failed to do i3c bus init, err=%d", ret);
-		return ret;
-	}
+	// ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
+	// if (ret != 0) {
+	// 	LOG_ERR("Failed to do i3c bus init, err=%d", ret);
+	// 	return ret;
+	// }
 
 	return 0;
 }
@@ -714,19 +722,28 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG_WRITE: {
-		struct i3c_msg *msg = data->msg;
+	case STM32_I3C_MSG: {
+		struct i3c_msg *msg = data->current_i3c_msg;
+
+		if (LL_I3C_IsActiveFlag_TXLAST(i3c)) {
+			data->current_i3c_msg++;
+		}
 
 		if (msg->num_xfer < msg->len) {
 			LL_I3C_TransmitData8(i3c, msg->buf[msg->num_xfer++]);
 		}
+
 		break;
 	}
-	case STM32_I2C_MSG_WRITE: {
-		struct i2c_msg *msg = data->i2c_msg;
+	case STM32_I2C_MSG: {
+		struct i2c_msg *msg = data->current_i2c_msg;
 
-		if (data->i2c_msg_idx < msg->len) {
-			LL_I3C_TransmitData8(i3c, msg->buf[data->i2c_msg_idx++]);
+		if (LL_I3C_IsActiveFlag_TXLAST(i3c)) {
+			data->current_i2c_msg++;
+		}
+
+		if (data->current_i2c_msg_idx < msg->len) {
+			LL_I3C_TransmitData8(i3c, msg->buf[data->current_i2c_msg_idx++]);
 		}
 		break;
 	}
@@ -808,19 +825,28 @@ static void i3c_stm32_event_isr_rx(const struct device *dev)
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG_READ: {
-		struct i3c_msg *msg = data->msg;
+	case STM32_I3C_MSG: {
+		struct i3c_msg *msg = data->current_i3c_msg;
+
+		if (LL_I3C_IsActiveFlag_RXLAST(i3c)) {
+			data->current_i3c_msg++;
+		}
 
 		if (msg->num_xfer < msg->len) {
 			msg->buf[msg->num_xfer++] = LL_I3C_ReceiveData8(i3c);
 		}
+
 		break;
 	}
-	case STM32_I2C_MSG_READ: {
-		struct i2c_msg *msg = data->i2c_msg;
+	case STM32_I2C_MSG: {
+		struct i2c_msg *msg = data->current_i2c_msg;
 
-		if (data->i2c_msg_idx < msg->len) {
-			msg->buf[data->i2c_msg_idx++] = LL_I3C_ReceiveData8(i3c);
+		if (LL_I3C_IsActiveFlag_RXLAST(i3c)) {
+			data->current_i2c_msg++;
+		}
+
+		if (data->current_i2c_msg_idx < msg->len) {
+			msg->buf[data->current_i2c_msg_idx++] = LL_I3C_ReceiveData8(i3c);
 		}
 		break;
 	}
@@ -865,28 +891,30 @@ static void i3c_stm32_event_isr_cf(const struct device *dev)
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG_READ: {
+	case STM32_I3C_MSG: {
 		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->msg->len, LL_I3C_DIRECTION_READ,
-			LL_I3C_CONTROLLER_MTYPE_PRIVATE, LL_I3C_GENERATE_STOP);
+			i3c, data->target_addr, data->current_i3c_msg_cf->len,
+			((data->current_i3c_msg_cf->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
+				? LL_I3C_DIRECTION_READ
+				: LL_I3C_DIRECTION_WRITE,
+			LL_I3C_CONTROLLER_MTYPE_PRIVATE,
+			((data->num_msgs > 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP));
+
+		data->current_i3c_msg_cf++;
+		data->num_msgs--;
 		break;
 	}
-	case STM32_I3C_MSG_WRITE: {
+	case STM32_I2C_MSG: {
 		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->msg->len, LL_I3C_DIRECTION_WRITE,
-			LL_I3C_CONTROLLER_MTYPE_PRIVATE, LL_I3C_GENERATE_STOP);
-		break;
-	}
-	case STM32_I2C_MSG_READ: {
-		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->i2c_msg->len, LL_I3C_DIRECTION_READ,
-			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C, LL_I3C_GENERATE_STOP);
-		break;
-	}
-	case STM32_I2C_MSG_WRITE: {
-		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->i2c_msg->len, LL_I3C_DIRECTION_WRITE,
-			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C, LL_I3C_GENERATE_STOP);
+			i3c, data->target_addr, data->current_i2c_msg->len,
+			((data->current_i2c_msg_cf->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ)
+				? LL_I3C_DIRECTION_READ
+				: LL_I3C_DIRECTION_WRITE,
+			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C,
+			((data->num_msgs > 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP));
+
+		data->current_i2c_msg_cf++;
+		data->num_msgs--;
 		break;
 	}
 	case STM32_I3C_MSG_CCC:
