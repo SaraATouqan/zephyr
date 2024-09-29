@@ -87,6 +87,7 @@ struct i3c_stm32_data {
 		uint8_t addr[4];       /* List of target addresses */
 		uint8_t num_addr;      /* Number of valid addresses */
 	} ibi;
+	struct k_sem ibi_lock_sem; /* Semaphore used for ibi requests */
 #endif
 };
 
@@ -680,6 +681,9 @@ static int i3c_stm32_init(const struct device *dev)
 	 */
 	k_sem_init(&data->bus_mutex, 1, 1);
 
+	/* initialize semaphore used when multiple ibi requests are taking place */
+	k_sem_init(&data->ibi_lock_sem, 1, 1);
+
 	ret = i3c_addr_slots_init(dev);
 	if (ret != 0) {
 		LOG_ERR("Addr slots init fail, err=%d", ret);
@@ -959,6 +963,9 @@ static void i3c_stm32_event_isr(void *arg)
 	}
 
 #ifdef CONFIG_I3C_USE_IBI
+
+	k_sem_take(&data->ibi_lock_sem, K_FOREVER);
+
 	if (LL_I3C_IsActiveFlag_IBI(i3c)) {
 		/* Clear frame complete flag */
 		LL_I3C_ClearFlag_IBI(i3c);
@@ -1000,6 +1007,9 @@ static void i3c_stm32_event_isr(void *arg)
 			LOG_ERR("IBI Failed to enqueue hotjoin work");
 		}
 	}
+
+	k_sem_give(&data->ibi_lock_sem);
+
 #endif
 
 	if (LL_I3C_IsActiveFlag_WKP(I3C1)) {
