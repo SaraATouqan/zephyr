@@ -83,6 +83,10 @@ struct i3c_stm32_data {
 	uint32_t ibi_payload;      /* Received ibi payload */
 	uint32_t ibi_payload_size; /* Received payload size */
 	uint32_t ibi_target_addr;  /* Received target dynamic address */
+	struct {
+		uint8_t addr[4];       /* List of target addresses */
+		uint8_t num_addr;      /* Number of valid addresses */
+	} ibi;
 #endif
 };
 
@@ -765,15 +769,6 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 			i3c_addr_slots_mark_free(&data->drv_data.attached_dev.addr_slots, dyn_addr);
 		}
 
-		/* Set I3C bus devices configuration */
-#ifdef CONFIG_I3C_USE_IBI
-		if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
-			(((bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
-			LL_I3C_ConfigDeviceCapabilities(
-				i3c, (++data->target_id), dyn_addr, LL_I3C_GET_IBI_CAPABLE(bcr),
-				LL_I3C_GET_IBI_PAYLOAD(bcr), LL_I3C_GET_CR_CAPABLE(bcr));
-		}
-#endif
 		break;
 	}
 	case STM32_I3C_MSG_CCC: {
@@ -976,8 +971,8 @@ static void i3c_stm32_event_isr(void *arg)
 		} else {
 			LOG_INF("IBI done, payload received :%d,%d,%d\n", data->ibi_payload,
 				data->ibi_payload_size, data->ibi_target_addr);
-			struct i3c_device_desc *target = NULL;
 			if ((data->ibi_payload != 0) && (data->ibi_payload_size != 0)) {
+				struct i3c_device_desc *target;
 				target = i3c_dev_list_i3c_addr_find(&data->drv_data.attached_dev,
 									data->ibi_target_addr);
 
@@ -1066,6 +1061,123 @@ static void i3c_stm32_error_isr(void *arg)
 	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 }
 
+#ifdef CONFIG_I3C_USE_IBI
+int i3c_stm32_ibi_enable(const struct device *dev,
+			struct i3c_device_desc *target)
+{
+	int ret = 0;
+	uint8_t idx;
+	I3C_TypeDef *i3c;
+	struct i3c_ccc_events i3c_events;
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+
+	i3c = config->i3c;
+	if (!i3c_device_is_ibi_capable(target)) {
+		return -EINVAL;
+	}
+
+	if (data->ibi.num_addr >= ARRAY_SIZE(data->ibi.addr)) {
+		/* No more free entries in the IBI table */
+		LOG_ERR("%s: no more free space in the IBI table", __func__);
+		return -ENOMEM;
+	}
+
+	for (idx = 0; idx < ARRAY_SIZE(data->ibi.addr); idx++) {
+		if (data->ibi.addr[idx] == target->dynamic_addr) {
+			LOG_ERR("%s: selected target is already in the list", __func__);
+			return -EINVAL;
+		}
+	}
+
+	if (data->ibi.num_addr > 0) {
+		for (idx = 0; idx < ARRAY_SIZE(data->ibi.addr); idx++) {
+			if (data->ibi.addr[idx] == 0U) {
+				break;
+			}
+		}
+
+		if (idx >= ARRAY_SIZE(data->ibi.addr)) {
+			LOG_ERR("Cannot support more IBIs");
+			return -ENOTSUP;
+		}
+
+	} else {
+		idx = 0;
+	}
+
+	data->ibi.addr[idx] = target->dynamic_addr;
+	data->ibi.num_addr += 1U;
+
+	/* Tell target to enable IBI */
+	i3c_events.events = I3C_CCC_EVT_INTR;
+	ret = i3c_ccc_do_events_set(target, true, &i3c_events);
+	if (ret != 0) {
+		LOG_ERR("Error sending IBI ENEC for 0x%02x (%d)",
+			target->dynamic_addr, ret);
+	}
+
+	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
+		(((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
+		/* Set I3C bus devices configuration */
+		LL_I3C_ConfigDeviceCapabilities(
+			i3c, (idx+1), target->dynamic_addr, LL_I3C_IBI_CAPABILITY,
+			LL_I3C_IBI_DATA_ENABLE, LL_I3C_CR_NO_CAPABILITY);
+	}
+
+	return ret;
+}
+
+int i3c_stm32_ibi_disable(const struct device *dev,
+			 struct i3c_device_desc *target)
+{
+	int ret = 0;
+	uint8_t idx;
+	I3C_TypeDef *i3c;
+	struct i3c_ccc_events i3c_events;
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+
+	i3c = config->i3c;
+	if (!i3c_device_is_ibi_capable(target)) {
+		return -EINVAL;
+	}
+
+	for (idx = 0; idx < ARRAY_SIZE(data->ibi.addr); idx++) {
+		if (target->dynamic_addr == data->ibi.addr[idx]) {
+			break;
+		}
+	}
+
+	if (idx == ARRAY_SIZE(data->ibi.addr)) {
+		LOG_ERR("%s: target is not in list of registered addresses", __func__);
+		return -ENODEV;
+	}
+
+	data->ibi.addr[idx] = 0U;
+	data->ibi.num_addr -= 1U;
+
+	/* Tell target to disable IBI */
+	i3c_events.events = I3C_CCC_EVT_INTR;
+	ret = i3c_ccc_do_events_set(target, false, &i3c_events);
+	if (ret != 0) {
+		LOG_ERR("Error sending IBI DISEC for 0x%02x (%d)",
+			target->dynamic_addr, ret);
+	}
+
+	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
+		(((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
+		/* Set I3C bus devices configuration */
+		LL_I3C_ConfigDeviceCapabilities(
+			i3c, (idx + 1), target->dynamic_addr, LL_I3C_IBI_NO_CAPABILITY,
+			LL_I3C_IBI_DATA_DISABLE, LL_I3C_CR_NO_CAPABILITY);
+	}
+
+	return ret;
+}
+
+#endif /* CONFIG_I3C_USE_IBI */
+
 static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.i2c_api.configure = i3c_stm32_i2c_configure,
 	.i2c_api.transfer = i3c_stm32_i2c_transfer,
@@ -1075,6 +1187,10 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.i3c_xfers = i3c_stm32_transfer,
 	.do_daa = i3c_stm32_do_daa,
 	.do_ccc = i3c_stm32_do_ccc,
+#ifdef CONFIG_I3C_USE_IBI
+	.ibi_enable = i3c_stm32_ibi_enable,
+	.ibi_disable = i3c_stm32_ibi_disable,
+#endif
 };
 
 #define STM32_I3C_IRQ_CONNECT_AND_ENABLE(index)                                                    \
