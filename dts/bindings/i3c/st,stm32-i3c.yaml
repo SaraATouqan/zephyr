@@ -18,3 +18,31 @@ properties:
   pinctrl-names:
     required: true
 
+  dmas:
+    description: |
+      Optional DMA channel specifier, required for DMA transactions.
+      For example dmas for TX/RX/TC/RS on I3C
+         	dmas = <&gpdma1 0 120 STM32_DMA_PERIPH_RX
+          &gpdma1 1 121 STM32_DMA_PERIPH_TX
+          &gpdma1 2 122 (STM32_DMA_PERIPH_TX | STM32_DMA_MEM_32BITS | STM32_DMA_PERIPH_32BITS)
+          &gpdma1 3 123 (STM32_DMA_PERIPH_RX | STM32_DMA_MEM_32BITS | STM32_DMA_PERIPH_32BITS)>;
+
+      With, in each cell of the dmas specifier:
+      - &gpdma1: dma controller phandle
+      - 0: channel number (0 to Max-Channel minus 1). From 0 to 7 on stm32h5x.
+      - 120: slot number (request which could be given by the GPDMA)
+      - STM32_DMA_PERIPH_RX: channel configuration (only for srce/dest data size, priority)
+
+      For example dmas for TX/RX/TC/RS on I3C
+          dmas = <&gpdma1 0 120 STM32_DMA_PERIPH_RX
+          &gpdma1 1 121 STM32_DMA_PERIPH_TX
+          &gpdma1 2 122 (STM32_DMA_PERIPH_TX | STM32_DMA_MEM_32BITS | STM32_DMA_PERIPH_32BITS)
+          &gpdma1 3 123 (STM32_DMA_PERIPH_RX | STM32_DMA_MEM_32BITS | STM32_DMA_PERIPH_32BITS)>;
+
+  dma-names:
+    description: |
+      DMA channel name. If DMA should be used, expected value is "rx" "tx" "tc" "rs".
+
+      For example
+         dma-names = "rx", "tx", "tc", "rs";
+

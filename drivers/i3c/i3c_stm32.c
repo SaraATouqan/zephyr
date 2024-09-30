@@ -10,6 +10,10 @@
 #include <stm32h5xx_ll_system.h>
 #include <stm32h5xx_ll_cortex.h>
 #include <zephyr/drivers/pinctrl.h>
+#ifdef CONFIG_I3C_STM32_DMA
+#include <zephyr/drivers/dma/dma_stm32.h>
+#include <zephyr/drivers/dma.h>
+#endif
 #include <zephyr/pm/policy.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
@@ -40,6 +44,10 @@ LOG_MODULE_REGISTER(i3c_stm32, CONFIG_I3C_LOG_LEVEL);
 /* Integer divison with ceiling */
 #define INT_DIV_CEIL(a, b) (((a) + (b - 1)) / b)
 
+#ifdef CONFIG_I3C_STM32_DMA
+K_HEAP_DEFINE(stm32_i3c_fifo_heap, CONFIG_I3C_STM32_DMA_FIFO_HEAP_SIZE);
+#endif
+
 typedef void (*irq_config_func_t)(const struct device *port);
 
 enum i3c_stm32_msg_state {
@@ -52,6 +60,19 @@ enum i3c_stm32_msg_state {
 	STM32_I3C_MSG_ERR,    /* Error state */
 	STM32_I3C_MSG_INVAL,  /* Invalid state */
 };
+
+#ifdef CONFIG_I3C_STM32_DMA
+struct i3c_stm32_dma_stream {
+	const struct device *dma_dev;
+	uint32_t dma_channel;
+	struct dma_config dma_cfg;
+	uint8_t priority;
+	bool src_addr_increment;
+	bool dst_addr_increment;
+	int fifo_threshold;
+	struct dma_block_config blk_cfg;
+};
+#endif
 
 struct i3c_stm32_config {
 	struct i3c_driver_config drv_cfg;      /* I3C driver config */
@@ -73,24 +94,35 @@ struct i3c_stm32_data {
 	uint8_t target_addr;          /* Current target xfer address */
 	struct i3c_msg
 		*current_i3c_msg; /* Pointer to the current private message to send on the bus */
-	struct i3c_msg *current_i3c_msg_cf; /* Pointer to the private messagethat will be used by
+	struct i3c_msg *current_i3c_msg_cf; /* Pointer to the private message that will be used by
 						   the control FIFO */
+	struct i3c_msg *current_i3c_msg_sf; /* Pointer to the private message that will be used by
+						   the status FIFO */
 	struct i2c_msg
 		*current_i2c_msg; /* Pointer to the current legacy message to send on the bus */
 	struct i2c_msg *current_i2c_msg_cf; /* Pointer to the I2C legavy message that will be used
 						   by the control FIFO */
-	size_t current_i2c_msg_idx;         /* Current I2C legacy message transfer index */
+	size_t current_msg_idx;             /* Current message transfer index */
 	uint8_t num_msgs;                   /* Number of messages to send on bus */
-	uint64_t pid;                       /* Current DAA target PID */
-	size_t daa_rx_rcv;                  /* Number of RX bytes received during DAA */
-	uint8_t target_id;                  /* Target id */
+#ifdef CONFIG_I3C_STM32_DMA
+	struct i3c_stm32_dma_stream dma_rx; /* RX DMA channel config */
+	struct i3c_stm32_dma_stream dma_tx; /* TX DMA channel config */
+	struct i3c_stm32_dma_stream dma_tc; /* Control FIFO DMA channel config */
+	struct i3c_stm32_dma_stream dma_rs; /* Status FIFO DMA channel config */
+	uint32_t *status_fifo;  /* Pointer to the allocated region for status FIFO words */
+	uint32_t *control_fifo; /* Pointer to the allocated region for control FIFO words */
+	size_t fifo_len;        /* The size in bytes for the allocated region for each FIFO */
+#endif
+	uint64_t pid;      /* Current DAA target PID */
+	size_t daa_rx_rcv; /* Number of RX bytes received during DAA */
+	uint8_t target_id; /* Target id */
 #ifdef CONFIG_I3C_USE_IBI
 	uint32_t ibi_payload;      /* Received ibi payload */
 	uint32_t ibi_payload_size; /* Received payload size */
 	uint32_t ibi_target_addr;  /* Received target dynamic address */
 	struct {
-		uint8_t addr[4];       /* List of target addresses */
-		uint8_t num_addr;      /* Number of valid addresses */
+		uint8_t addr[4];  /* List of target addresses */
+		uint8_t num_addr; /* Number of valid addresses */
 	} ibi;
 	struct k_sem ibi_lock_sem; /* Semaphore used for ibi requests */
 #endif
@@ -112,25 +144,6 @@ static int i3c_stm32_activate(const struct device *dev)
 		return -EIO;
 	}
 	return 0;
-}
-
-static void i3c_stm32_flush_all_fifo(const struct device *dev)
-{
-	const struct i3c_stm32_config *config = dev->config;
-	I3C_TypeDef *i3c = config->i3c;
-
-	LL_I3C_RequestControlFIFOFlush(i3c);
-	LL_I3C_RequestRxFIFOFlush(i3c);
-	LL_I3C_RequestTxFIFOFlush(i3c);
-}
-
-static void i3c_stm32_clear_err(const struct device *dev)
-{
-	struct i3c_stm32_data *data = dev->data;
-
-	i3c_stm32_flush_all_fifo(dev);
-
-	data->msg_state = STM32_I3C_MSG_IDLE;
 }
 
 static int i3c_stm32_calc_scll_od_sclh_i2c(uint32_t i2c_bus_freq, uint32_t i3c_clock,
@@ -156,15 +169,15 @@ static int i3c_stm32_calc_scll_od_sclh_i2c(uint32_t i2c_bus_freq, uint32_t i3c_c
 	}
 
 	if (i2c_bus_freq > 400000 &&
-		*sclh_i2c <
-			INT_DIV_CEIL(STM32_I3C_SCLH_I2C_MIN_FMP_NS * i3c_clock, 1000000000ull) - 1) {
+	    *sclh_i2c <
+		    INT_DIV_CEIL(STM32_I3C_SCLH_I2C_MIN_FMP_NS * i3c_clock, 1000000000ull) - 1) {
 		LOG_ERR("Cannot find a combination of SCLL_OD and SCLH_I2C at current I3C clock "
 			"frequency for FM+ I2C bus");
 		return -EINVAL;
 	}
 
 	if (i2c_bus_freq > 0 &&
-		*sclh_i2c < INT_DIV_CEIL(STM32_I3C_SCLH_I2C_MIN_FM_NS * i3c_clock, 1000000000ull) - 1) {
+	    *sclh_i2c < INT_DIV_CEIL(STM32_I3C_SCLH_I2C_MIN_FM_NS * i3c_clock, 1000000000ull) - 1) {
 		LOG_ERR("Cannot find a combination of SCLL_OD and SCLH_I2C at current I3C clock "
 			"frequency for FM I2C bus");
 		return -EINVAL;
@@ -377,9 +390,11 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 	/* Bus will be idle initially */
 	data->msg_state = STM32_I3C_MSG_IDLE;
 	data->target_id = 0;
+#ifdef CONFIG_I3C_USE_IBI
 	data->ibi_payload = 0;
 	data->ibi_payload_size = 0;
 	data->ibi_target_addr = 0;
+#endif
 
 	return 0;
 }
@@ -409,12 +424,83 @@ static int i3c_stm32_i2c_configure(const struct device *dev, uint32_t config)
  * @return @see i3c_device_find.
  */
 static struct i3c_device_desc *i3c_stm32_device_find(const struct device *dev,
-						    const struct i3c_device_id *id)
+						     const struct i3c_device_id *id)
 {
 	const struct i3c_stm32_config *config = dev->config;
 
 	return i3c_dev_list_find(&config->drv_cfg.dev_list, id);
+}
 
+#ifdef CONFIG_I3C_STM32_DMA
+
+static void i3c_stm32_end_dma_requests(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	LL_I3C_EnableIT_TXFNF(i3c);
+	LL_I3C_EnableIT_RXFNE(i3c);
+	LL_I3C_EnableIT_CFNF(i3c);
+	LL_I3C_EnableIT_SFNE(i3c);
+
+	LL_I3C_DisableDMAReq_TX(i3c);
+	LL_I3C_DisableDMAReq_RX(i3c);
+	LL_I3C_DisableDMAReq_Control(i3c);
+	LL_I3C_DisableDMAReq_Status(i3c);
+}
+
+static void i3c_stm32_prepare_dma_requests(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	LL_I3C_DisableIT_TXFNF(i3c);
+	LL_I3C_DisableIT_RXFNE(i3c);
+	LL_I3C_DisableIT_CFNF(i3c);
+	LL_I3C_DisableIT_SFNE(i3c);
+
+	LL_I3C_EnableDMAReq_TX(i3c);
+	LL_I3C_EnableDMAReq_RX(i3c);
+	LL_I3C_EnableDMAReq_Control(i3c);
+	LL_I3C_EnableDMAReq_Status(i3c);
+}
+
+#endif
+
+static void i3c_stm32_flush_all_fifo(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	LL_I3C_RequestTxFIFOFlush(i3c);
+	LL_I3C_RequestRxFIFOFlush(i3c);
+	LL_I3C_RequestControlFIFOFlush(i3c);
+	LL_I3C_RequestStatusFIFOFlush(i3c);
+}
+
+static void i3c_stm32_clear_err(const struct device *dev, bool is_i2c_xfer)
+{
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	i3c_stm32_flush_all_fifo(dev);
+
+	/* Re-enable arbirtation header after exiting from error caused by legacy I2C msg */
+	if (is_i2c_xfer) {
+		LL_I3C_EnableArbitrationHeader(i3c);
+	}
+
+#ifdef CONFIG_I3C_STM32_DMA
+	i3c_stm32_end_dma_requests(dev);
+
+	k_heap_free(&stm32_i3c_fifo_heap, data->status_fifo);
+	k_heap_free(&stm32_i3c_fifo_heap, data->control_fifo);
+#endif
+
+	data->msg_state = STM32_I3C_MSG_IDLE;
+
+	k_sem_give(&data->bus_mutex);
 }
 
 /* Handles broadcast/direct CCCs except for ENTDAA */
@@ -434,13 +520,15 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
 
 	/* Check if payload has targets when sending a direct CCC */
 	if (!i3c_ccc_is_payload_broadcast(payload) &&
-		(payload->targets.payloads == NULL || payload->targets.num_targets == 0)) {
+	    (payload->targets.payloads == NULL || payload->targets.num_targets == 0)) {
 		return -EINVAL;
 	}
 
 	if (payload->ccc.data_len > 0 && payload->ccc.data == NULL) {
 		return -EINVAL;
 	}
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
 	(void)pm_device_runtime_get(dev);
@@ -463,19 +551,21 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
 	/* Start CCC transfer */
 	LL_I3C_ControllerHandleCCC(i3c, payload->ccc.id, payload->ccc.data_len,
 				   (i3c_ccc_is_payload_broadcast(payload)
-						? LL_I3C_GENERATE_STOP
-						: LL_I3C_GENERATE_RESTART));
+					    ? LL_I3C_GENERATE_STOP
+					    : LL_I3C_GENERATE_RESTART));
 
 	/* Wait for CCC to complete */
 	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-		i3c_stm32_clear_err(dev);
+		i3c_stm32_clear_err(dev, false);
 		return -ETIMEDOUT;
 	}
 
 	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev);
+		i3c_stm32_clear_err(dev, false);
 		return -EIO;
 	}
+
+	k_sem_give(&data->bus_mutex);
 
 	return 0;
 }
@@ -486,6 +576,8 @@ static int i3c_stm32_do_daa(const struct device *dev)
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
 	(void)pm_device_runtime_get(dev);
@@ -510,18 +602,126 @@ static int i3c_stm32_do_daa(const struct device *dev)
 	}
 
 	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev);
+		i3c_stm32_clear_err(dev, false);
 		/* Enable TXFNF interrupt in case an error occured before it was enabled by RXFNE */
 		LL_I3C_EnableIT_TXFNF(i3c);
 		return -EIO;
 	}
 
+	k_sem_give(&data->bus_mutex);
+
 	return 0;
 }
 
+#ifdef CONFIG_I3C_STM32_DMA
+
+static int i3c_stm32_dma_msg_control_fifo_config(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	int ret;
+
+	data->dma_tc.blk_cfg.source_address = (uint32_t)data->control_fifo;
+	data->dma_tc.blk_cfg.block_size = data->fifo_len;
+
+	ret = dma_config(data->dma_tc.dma_dev, data->dma_tc.dma_channel, &data->dma_tc.dma_cfg);
+
+	if (ret != 0) {
+		LOG_ERR("Control DMA config error, err=%d", ret);
+		return -EINVAL;
+	}
+
+	if (dma_start(data->dma_tc.dma_dev, data->dma_tc.dma_channel)) {
+		LOG_ERR("Control DMA start failed");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_dma_msg_status_fifo_config(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	int ret;
+
+	data->dma_rs.blk_cfg.dest_address = (uint32_t)data->status_fifo;
+	data->dma_rs.blk_cfg.block_size = data->fifo_len;
+
+	ret = dma_config(data->dma_rs.dma_dev, data->dma_rs.dma_channel, &data->dma_rs.dma_cfg);
+
+	if (ret != 0) {
+		LOG_ERR("Status DMA config error, err=%d", ret);
+		return -EINVAL;
+	}
+
+	if (dma_start(data->dma_rs.dma_dev, data->dma_rs.dma_channel)) {
+		LOG_ERR("Status DMA start failed");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_dma_msg_config(const struct device *dev, uint32_t buf_addr, size_t buf_len,
+				    bool is_read)
+{
+	struct i3c_stm32_data *data = dev->data;
+	int ret;
+
+	if (is_read) {
+		data->dma_rx.blk_cfg.dest_address = buf_addr;
+		data->dma_rx.blk_cfg.block_size = buf_len;
+
+		ret = dma_config(data->dma_rx.dma_dev, data->dma_rx.dma_channel,
+				 &data->dma_rx.dma_cfg);
+
+		if (ret != 0) {
+			LOG_ERR("RX DMA config error, err=%d", ret);
+			return -EINVAL;
+		}
+
+		if (dma_start(data->dma_rx.dma_dev, data->dma_rx.dma_channel)) {
+			LOG_ERR("RX DMA start failed");
+			return -EFAULT;
+		}
+
+		return 0;
+	}
+
+	data->dma_tx.blk_cfg.source_address = buf_addr;
+	data->dma_tx.blk_cfg.block_size = buf_len;
+
+	ret = dma_config(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &data->dma_tx.dma_cfg);
+
+	if (ret != 0) {
+		LOG_ERR("TX DMA config error, err=%d", ret);
+		return -EINVAL;
+	}
+
+	if (dma_start(data->dma_tx.dma_dev, data->dma_tx.dma_channel)) {
+		LOG_ERR("TX DMA start failed");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_dma_i3c_msg_config(const struct device *dev, struct i3c_msg *msg)
+{
+	return i3c_stm32_dma_msg_config(dev, (uint32_t)msg->buf, msg->len,
+					((msg->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ));
+}
+
+static int i3c_stm32_dma_i2c_msg_config(const struct device *dev, struct i2c_msg *msg)
+{
+	return i3c_stm32_dma_msg_config(dev, (uint32_t)msg->buf, msg->len,
+					((msg->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ));
+}
+
+#endif
+
 /* Handles the controller private read/write transfers */
 static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *target,
-				  struct i3c_msg *msgs, uint8_t num_msgs)
+			      struct i3c_msg *msgs, uint8_t num_msgs)
 {
 	struct i3c_stm32_data *data = dev->data;
 	const struct i3c_stm32_config *config = dev->config;
@@ -547,21 +747,76 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
 	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
 	data->current_i3c_msg_cf = &msgs[0];
+	data->current_i3c_msg_sf = &msgs[0];
 	data->current_i3c_msg = &msgs[0];
+	data->current_msg_idx = 0;
 	data->num_msgs = num_msgs;
+
+#ifdef CONFIG_I3C_STM32_DMA
+	data->fifo_len = num_msgs * sizeof(uint32_t);
+	data->control_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	data->status_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	int ret;
+
+	/* Prepare all control words for all messages on the transfer */
+	for (size_t i = 0; i < num_msgs; i++) {
+		WRITE_REG(data->control_fifo[i],
+			  ((data->target_addr << I3C_CR_ADD_Pos) | msgs[i].len |
+			   (((msgs[i].flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
+				    ? LL_I3C_DIRECTION_READ
+				    : LL_I3C_DIRECTION_WRITE) |
+			   LL_I3C_CONTROLLER_MTYPE_PRIVATE |
+			   ((i < num_msgs - 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP)) &
+				  (I3C_CR_ADD | I3C_CR_DCNT | I3C_CR_RNW | I3C_CR_MTYPE |
+				   I3C_CR_MEND));
+	}
+
+	/* Configure DMA for the first message only, DMA callback will take care of the rest */
+	ret = i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_control_fifo_config(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_status_fifo_config(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		return ret;
+	}
+
+	i3c_stm32_prepare_dma_requests(dev);
+#endif
 
 	LL_I3C_RequestTransfer(i3c);
 
 	/* Wait for whole transfer to complete */
 	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
+		i3c_stm32_clear_err(dev, false);
 		return -ETIMEDOUT;
 	}
 
 	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev);
-		k_sem_give(&data->bus_mutex);
+		i3c_stm32_clear_err(dev, false);
 		return -EIO;
 	}
+
+#ifdef CONFIG_I3C_STM32_DMA
+	/* Fill the num_xfer for each message from the status FIFO */
+	for (size_t i = 0; i < num_msgs; i++) {
+		msgs[i].num_xfer = READ_BIT(data->status_fifo[i], I3C_SR_XDCNT);
+	}
+
+	k_heap_free(&stm32_i3c_fifo_heap, data->control_fifo);
+	k_heap_free(&stm32_i3c_fifo_heap, data->status_fifo);
+
+	i3c_stm32_end_dma_requests(dev);
+#endif
 
 	k_sem_give(&data->bus_mutex);
 
@@ -575,7 +830,7 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (addr > 0xff) {
+	if (addr > 0x7f) {
 		LOG_ERR("This device only supports 7-bit addressing mode");
 		return -EINVAL;
 	}
@@ -604,25 +859,71 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 
 	data->current_i2c_msg_cf = &msgs[0];
 	data->current_i2c_msg = &msgs[0];
-	data->current_i2c_msg_idx = 0;
+	data->current_msg_idx = 0;
 	data->num_msgs = num_msgs;
+
+#ifdef CONFIG_I3C_STM32_DMA
+	data->fifo_len = num_msgs * sizeof(uint32_t);
+	data->control_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	data->status_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	int ret;
+
+	/* Prepare all control words for all messages on the transfer */
+	for (size_t i = 0; i < num_msgs; i++) {
+		WRITE_REG(data->control_fifo[i],
+			  ((data->target_addr << I3C_CR_ADD_Pos) | msgs[i].len |
+			   (((msgs[i].flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
+				    ? LL_I3C_DIRECTION_READ
+				    : LL_I3C_DIRECTION_WRITE) |
+			   LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C |
+			   ((i < num_msgs - 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP)) &
+				  (I3C_CR_ADD | I3C_CR_DCNT | I3C_CR_RNW | I3C_CR_MTYPE |
+				   I3C_CR_MEND));
+	}
+
+	/* Configure DMA for the first message only, DMA callback will take care of the rest */
+	ret = i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, true);
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_control_fifo_config(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_status_fifo_config(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		return ret;
+	}
+
+	i3c_stm32_prepare_dma_requests(dev);
+#endif
 
 	LL_I3C_RequestTransfer(i3c);
 
 	/* Wait for current transfer to complete */
 	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-		LL_I3C_EnableArbitrationHeader(i3c);
+		i3c_stm32_clear_err(dev, true);
 		return -ETIMEDOUT;
 	}
 
 	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev);
-		LL_I3C_EnableArbitrationHeader(i3c);
-		k_sem_give(&data->bus_mutex);
+		i3c_stm32_clear_err(dev, true);
 		return -EIO;
 	}
 
 	LL_I3C_EnableArbitrationHeader(i3c);
+
+#ifdef CONFIG_I3C_STM32_DMA
+	k_heap_free(&stm32_i3c_fifo_heap, data->control_fifo);
+	k_heap_free(&stm32_i3c_fifo_heap, data->status_fifo);
+
+	i3c_stm32_end_dma_requests(dev);
+#endif
 
 	k_sem_give(&data->bus_mutex);
 
@@ -674,12 +975,161 @@ static int i3c_stm32_pm_action(const struct device *dev, enum pm_device_action a
 }
 #endif
 
+#ifdef CONFIG_I3C_STM32_DMA
+
+/* Initializes the I3C DMA */
+static int i3c_stm32_init_dma(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	if (data->dma_rx.dma_dev != NULL) {
+		if (!device_is_ready(data->dma_rx.dma_dev)) {
+			return -ENODEV;
+		}
+	}
+
+	if (data->dma_tx.dma_dev != NULL) {
+		if (!device_is_ready(data->dma_tx.dma_dev)) {
+			return -ENODEV;
+		}
+	}
+
+	if (data->dma_tc.dma_dev != NULL) {
+		if (!device_is_ready(data->dma_tc.dma_dev)) {
+			return -ENODEV;
+		}
+	}
+
+	if (data->dma_rs.dma_dev != NULL) {
+		if (!device_is_ready(data->dma_rs.dma_dev)) {
+			return -ENODEV;
+		}
+	}
+
+	/* Configure DMA RX config */
+	memset(&data->dma_rx.blk_cfg, 0, sizeof(data->dma_rx.blk_cfg));
+
+	data->dma_rx.blk_cfg.source_address =
+		LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_RECEIVE_BYTE);
+
+	data->dma_rx.blk_cfg.dest_address = 0; /* dest not ready */
+
+	if (data->dma_rx.src_addr_increment) {
+		data->dma_rx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_rx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	if (data->dma_rx.dst_addr_increment) {
+		data->dma_rx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_rx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	data->dma_rx.blk_cfg.source_reload_en = 0;
+	data->dma_rx.blk_cfg.dest_reload_en = 0;
+	data->dma_rx.blk_cfg.fifo_mode_control = data->dma_rx.fifo_threshold;
+
+	data->dma_rx.dma_cfg.head_block = &data->dma_rx.blk_cfg;
+	data->dma_rx.dma_cfg.user_data = (void *)dev;
+
+	/* Configure DMA RS config */
+	memset(&data->dma_rs.blk_cfg, 0, sizeof(data->dma_rs.blk_cfg));
+
+	data->dma_rs.blk_cfg.source_address = LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_STATUS);
+
+	data->dma_rs.blk_cfg.dest_address = 0; /* dest not ready */
+
+	if (data->dma_rs.src_addr_increment) {
+		data->dma_rs.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_rs.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	if (data->dma_rs.dst_addr_increment) {
+		data->dma_rs.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_rs.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	data->dma_rs.blk_cfg.source_reload_en = 0;
+	data->dma_rs.blk_cfg.dest_reload_en = 0;
+	data->dma_rs.blk_cfg.fifo_mode_control = data->dma_rs.fifo_threshold;
+
+	data->dma_rs.dma_cfg.head_block = &data->dma_rs.blk_cfg;
+	data->dma_rs.dma_cfg.user_data = (void *)dev;
+
+	/* Configure DMA TX config */
+	memset(&data->dma_tx.blk_cfg, 0, sizeof(data->dma_tx.blk_cfg));
+
+	data->dma_tx.blk_cfg.dest_address =
+		LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_TRANSMIT_BYTE);
+
+	data->dma_tx.blk_cfg.source_address = 0; /* not ready */
+
+	if (data->dma_tx.src_addr_increment) {
+		data->dma_tx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_tx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	if (data->dma_tx.dst_addr_increment) {
+		data->dma_tx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_tx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	data->dma_tx.blk_cfg.fifo_mode_control = data->dma_tx.fifo_threshold;
+
+	data->dma_tx.dma_cfg.head_block = &data->dma_tx.blk_cfg;
+	data->dma_tx.dma_cfg.user_data = (void *)dev;
+
+	/* Configure DMA TC config */
+	memset(&data->dma_tc.blk_cfg, 0, sizeof(data->dma_tc.blk_cfg));
+
+	data->dma_tc.blk_cfg.dest_address = LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_CONTROL);
+
+	data->dma_tc.blk_cfg.source_address = 0; /* not ready */
+
+	if (data->dma_tc.src_addr_increment) {
+		data->dma_tc.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_tc.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	if (data->dma_tc.dst_addr_increment) {
+		data->dma_tc.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		data->dma_tc.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	data->dma_tc.blk_cfg.fifo_mode_control = data->dma_tc.fifo_threshold;
+
+	data->dma_tc.dma_cfg.head_block = &data->dma_tc.blk_cfg;
+	data->dma_tc.dma_cfg.user_data = (void *)dev;
+
+	return 0;
+}
+
+#endif
+
 /* Initializes the I3C device and I3C bus */
 static int i3c_stm32_init(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
 	int ret;
+
+#ifdef CONFIG_I3C_STM32_DMA
+	ret = i3c_stm32_init_dma(dev);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to init I3C DMA, err=%d", ret);
+		return ret;
+	}
+#endif
 
 	k_sem_init(&data->device_sync_sem, 0, K_SEM_MAX_LIMIT);
 
@@ -706,11 +1156,11 @@ static int i3c_stm32_init(const struct device *dev)
 	(void)pm_device_runtime_enable(dev);
 #endif
 
-	// ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
-	// if (ret != 0) {
-	// 	LOG_ERR("Failed to do i3c bus init, err=%d", ret);
-	// 	return ret;
-	// }
+	ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
+	if (ret != 0) {
+		LOG_ERR("Failed to do i3c bus init, err=%d", ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -729,8 +1179,13 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 			data->current_i3c_msg++;
 		}
 
-		if (msg->num_xfer < msg->len) {
-			LL_I3C_TransmitData8(i3c, msg->buf[msg->num_xfer++]);
+		if (data->current_msg_idx < msg->len) {
+			LL_I3C_TransmitData8(i3c, msg->buf[data->current_msg_idx++]);
+		}
+
+		/* Reset msg_idx after moving on to the next message */
+		if (msg != data->current_i3c_msg) {
+			data->current_msg_idx = 0;
 		}
 
 		break;
@@ -742,8 +1197,13 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 			data->current_i2c_msg++;
 		}
 
-		if (data->current_i2c_msg_idx < msg->len) {
-			LL_I3C_TransmitData8(i3c, msg->buf[data->current_i2c_msg_idx++]);
+		if (data->current_msg_idx < msg->len) {
+			LL_I3C_TransmitData8(i3c, msg->buf[data->current_msg_idx++]);
+		}
+
+		/* Reset msg_idx after moving on to the next message */
+		if (msg != data->current_i2c_msg) {
+			data->current_msg_idx = 0;
 		}
 		break;
 	}
@@ -786,7 +1246,7 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 
 		/* Mark the static address as free */
 		if ((target != NULL) && (target->static_addr != 0) &&
-			(dyn_addr != target->static_addr)) {
+		    (dyn_addr != target->static_addr)) {
 			i3c_addr_slots_mark_free(&data->drv_data.attached_dev.addr_slots, dyn_addr);
 		}
 
@@ -832,8 +1292,13 @@ static void i3c_stm32_event_isr_rx(const struct device *dev)
 			data->current_i3c_msg++;
 		}
 
-		if (msg->num_xfer < msg->len) {
-			msg->buf[msg->num_xfer++] = LL_I3C_ReceiveData8(i3c);
+		if (data->current_msg_idx < msg->len) {
+			msg->buf[data->current_msg_idx++] = LL_I3C_ReceiveData8(i3c);
+		}
+
+		/* Reset msg_idx after moving on to the next message */
+		if (msg != data->current_i3c_msg) {
+			data->current_msg_idx = 0;
 		}
 
 		break;
@@ -845,9 +1310,15 @@ static void i3c_stm32_event_isr_rx(const struct device *dev)
 			data->current_i2c_msg++;
 		}
 
-		if (data->current_i2c_msg_idx < msg->len) {
-			msg->buf[data->current_i2c_msg_idx++] = LL_I3C_ReceiveData8(i3c);
+		if (data->current_msg_idx < msg->len) {
+			msg->buf[data->current_msg_idx++] = LL_I3C_ReceiveData8(i3c);
 		}
+
+		/* Reset msg_idx after moving on to the next message */
+		if (msg != data->current_i2c_msg) {
+			data->current_msg_idx = 0;
+		}
+
 		break;
 	}
 	case STM32_I3C_MSG_DAA: {
@@ -969,11 +1440,18 @@ static void i3c_stm32_event_isr(void *arg)
 		i3c_stm32_event_isr_cf(dev);
 	}
 
+	/* Status FIFO not empty handler */
 	if (LL_I3C_IsActiveFlag_SFNE(i3c) && LL_I3C_IsEnabledIT_SFNE(i3c)) {
-		/* Will be read and discarded since there's no real use for it */
-		uint32_t status_reg = i3c->SR;
 
-		ARG_UNUSED(status_reg);
+		if (data->msg_state == STM32_I3C_MSG) {
+			data->current_i3c_msg_sf->num_xfer = LL_I3C_GetXferDataCount(i3c);
+			data->current_i3c_msg_sf++;
+		} else {
+			/* Read and discard the status FIFO word since it will not be used */
+			uint32_t status_reg = i3c->SR;
+
+			ARG_UNUSED(status_reg);
+		}
 	}
 
 	/* Frame complete handler */
@@ -1001,7 +1479,7 @@ static void i3c_stm32_event_isr(void *arg)
 		data->ibi_payload_size = LL_I3C_GetNbIBIAddData(i3c);
 		data->ibi_target_addr = LL_I3C_GetIBITargetAddr(i3c);
 		if ((data->ibi_payload == 0) && (data->ibi_payload_size == 0) &&
-			(data->ibi_target_addr == 0)) {
+		    (data->ibi_target_addr == 0)) {
 			LOG_ERR("Invalid Payload\n");
 		} else {
 			LOG_INF("IBI done, payload received :%d,%d,%d\n", data->ibi_payload,
@@ -1009,12 +1487,12 @@ static void i3c_stm32_event_isr(void *arg)
 			if ((data->ibi_payload != 0) && (data->ibi_payload_size != 0)) {
 				struct i3c_device_desc *target;
 				target = i3c_dev_list_i3c_addr_find(&data->drv_data.attached_dev,
-									data->ibi_target_addr);
+								    data->ibi_target_addr);
 
 				if (target != NULL) {
-					if (i3c_ibi_work_enqueue_target_irq(target,
-									(uint8_t *)&data->ibi_payload,
-									data->ibi_payload_size) != 0) {
+					if (i3c_ibi_work_enqueue_target_irq(
+						    target, (uint8_t *)&data->ibi_payload,
+						    data->ibi_payload_size) != 0) {
 						LOG_ERR("Error enqueue IBI IRQ work");
 					}
 				} else {
@@ -1100,8 +1578,7 @@ static void i3c_stm32_error_isr(void *arg)
 }
 
 #ifdef CONFIG_I3C_USE_IBI
-int i3c_stm32_ibi_enable(const struct device *dev,
-			struct i3c_device_desc *target)
+int i3c_stm32_ibi_enable(const struct device *dev, struct i3c_device_desc *target)
 {
 	int ret = 0;
 	uint8_t idx;
@@ -1151,23 +1628,21 @@ int i3c_stm32_ibi_enable(const struct device *dev,
 	i3c_events.events = I3C_CCC_EVT_INTR;
 	ret = i3c_ccc_do_events_set(target, true, &i3c_events);
 	if (ret != 0) {
-		LOG_ERR("Error sending IBI ENEC for 0x%02x (%d)",
-			target->dynamic_addr, ret);
+		LOG_ERR("Error sending IBI ENEC for 0x%02x (%d)", target->dynamic_addr, ret);
 	}
 
 	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
-		(((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
+	    (((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
 		/* Set I3C bus devices configuration */
-		LL_I3C_ConfigDeviceCapabilities(
-			i3c, (idx+1), target->dynamic_addr, LL_I3C_IBI_CAPABILITY,
-			LL_I3C_IBI_DATA_ENABLE, LL_I3C_CR_NO_CAPABILITY);
+		LL_I3C_ConfigDeviceCapabilities(i3c, (idx + 1), target->dynamic_addr,
+						LL_I3C_IBI_CAPABILITY, LL_I3C_IBI_DATA_ENABLE,
+						LL_I3C_CR_NO_CAPABILITY);
 	}
 
 	return ret;
 }
 
-int i3c_stm32_ibi_disable(const struct device *dev,
-			 struct i3c_device_desc *target)
+int i3c_stm32_ibi_disable(const struct device *dev, struct i3c_device_desc *target)
 {
 	int ret = 0;
 	uint8_t idx;
@@ -1199,22 +1674,67 @@ int i3c_stm32_ibi_disable(const struct device *dev,
 	i3c_events.events = I3C_CCC_EVT_INTR;
 	ret = i3c_ccc_do_events_set(target, false, &i3c_events);
 	if (ret != 0) {
-		LOG_ERR("Error sending IBI DISEC for 0x%02x (%d)",
-			target->dynamic_addr, ret);
+		LOG_ERR("Error sending IBI DISEC for 0x%02x (%d)", target->dynamic_addr, ret);
 	}
 
 	if (((target != NULL) && i3c_device_is_ibi_capable(target)) ||
-		(((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
+	    (((target->bcr & I3C_BCR_IBI_REQUEST_CAPABLE) == I3C_BCR_IBI_REQUEST_CAPABLE))) {
 		/* Set I3C bus devices configuration */
-		LL_I3C_ConfigDeviceCapabilities(
-			i3c, (idx + 1), target->dynamic_addr, LL_I3C_IBI_NO_CAPABILITY,
-			LL_I3C_IBI_DATA_DISABLE, LL_I3C_CR_NO_CAPABILITY);
+		LL_I3C_ConfigDeviceCapabilities(i3c, (idx + 1), target->dynamic_addr,
+						LL_I3C_IBI_NO_CAPABILITY, LL_I3C_IBI_DATA_DISABLE,
+						LL_I3C_CR_NO_CAPABILITY);
 	}
 
 	return ret;
 }
 
 #endif /* CONFIG_I3C_USE_IBI */
+
+#ifdef CONFIG_I3C_STM32_DMA
+
+static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
+				int status)
+{
+	const struct device *dev = (const struct device *)user_data;
+	struct i3c_stm32_data *data = dev->data;
+
+	if (data->msg_state == STM32_I3C_MSG) {
+		data->current_i3c_msg++;
+		i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
+	} else if (data->msg_state == STM32_I2C_MSG) {
+		data->current_i2c_msg++;
+		i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
+	}
+}
+
+static void i3c_stm32_dma_rx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
+				int status)
+{
+	const struct device *dev = (const struct device *)user_data;
+	struct i3c_stm32_data *data = dev->data;
+
+	if (data->msg_state == STM32_I3C_MSG) {
+		data->current_i3c_msg++;
+		i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
+	} else if (data->msg_state == STM32_I2C_MSG) {
+		data->current_i2c_msg++;
+		i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
+	}
+}
+
+static void i3c_stm32_dma_tc_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
+				int status)
+{
+	return;
+}
+
+static void i3c_stm32_dma_rs_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
+				int status)
+{
+	return;
+}
+
+#endif
 
 static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.i2c_api.configure = i3c_stm32_i2c_configure,
@@ -1231,16 +1751,54 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 #endif
 };
 
+#ifdef CONFIG_I3C_STM32_DMA
+#define STM32_I3C_DMA_CHANNEL_INIT(index, dir, dir_cap, src_dev, dest_dev)                         \
+	.dma_dev = DEVICE_DT_GET(STM32_DMA_CTLR(index, dir)),                                      \
+	.dma_channel = DT_INST_DMAS_CELL_BY_NAME(index, dir, channel),                             \
+	.dma_cfg =                                                                                 \
+		{                                                                                  \
+			.dma_slot = STM32_DMA_SLOT(index, dir, slot),                              \
+			.channel_direction =                                                       \
+				STM32_DMA_CONFIG_DIRECTION(STM32_DMA_CHANNEL_CONFIG(index, dir)),  \
+			.channel_priority =                                                        \
+				STM32_DMA_CONFIG_PRIORITY(STM32_DMA_CHANNEL_CONFIG(index, dir)),   \
+			.source_data_size = STM32_DMA_CONFIG_##src_dev##_DATA_SIZE(                \
+				STM32_DMA_CHANNEL_CONFIG(index, dir)),                             \
+			.dest_data_size = STM32_DMA_CONFIG_##dest_dev##_DATA_SIZE(                 \
+				STM32_DMA_CHANNEL_CONFIG(index, dir)),                             \
+			.source_burst_length = 1, /* SINGLE transfer */                            \
+			.dest_burst_length = 1,                                                    \
+			.block_count = 1,                                                          \
+			.dma_callback = i3c_stm32_dma_##dir##_cb,                                  \
+	},                                                                                         \
+	.src_addr_increment =                                                                      \
+		STM32_DMA_CONFIG_##src_dev##_ADDR_INC(STM32_DMA_CHANNEL_CONFIG(index, dir)),       \
+	.dst_addr_increment =                                                                      \
+		STM32_DMA_CONFIG_##dest_dev##_ADDR_INC(STM32_DMA_CHANNEL_CONFIG(index, dir)),      \
+	.fifo_threshold = STM32_DMA_FEATURES_FIFO_THRESHOLD(STM32_DMA_FEATURES(index, dir)),
+
+#endif
+
+#ifdef CONFIG_I3C_STM32_DMA
+#define STM32_I3C_DMA_CHANNEL(index, dir, DIR, src, dest)                                          \
+	.dma_##dir = {COND_CODE_1(DT_INST_DMAS_HAS_NAME(index, dir),                               \
+				  (STM32_I3C_DMA_CHANNEL_INIT(index, dir, DIR, src, dest)),        \
+				  (NULL))},
+
+#else
+#define STM32_I3C_DMA_CHANNEL(index, dir, DIR, src, dest)
+#endif
+
 #define STM32_I3C_IRQ_CONNECT_AND_ENABLE(index)                                                    \
 	do {                                                                                       \
 		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(index, event, irq),                                \
-				DT_INST_IRQ_BY_NAME(index, event, priority), i3c_stm32_event_isr,      \
-				DEVICE_DT_INST_GET(index), 0);                                         \
+			    DT_INST_IRQ_BY_NAME(index, event, priority), i3c_stm32_event_isr,      \
+			    DEVICE_DT_INST_GET(index), 0);                                         \
 		irq_enable(DT_INST_IRQ_BY_NAME(index, event, irq));                                \
-																								   \
+                                                                                                   \
 		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(index, error, irq),                                \
-				DT_INST_IRQ_BY_NAME(index, error, priority), i3c_stm32_error_isr,      \
-				DEVICE_DT_INST_GET(index), 0);                                         \
+			    DT_INST_IRQ_BY_NAME(index, error, priority), i3c_stm32_error_isr,      \
+			    DEVICE_DT_INST_GET(index), 0);                                         \
 		irq_enable(DT_INST_IRQ_BY_NAME(index, error, irq));                                \
 	} while (false)
 
@@ -1257,14 +1815,14 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 
 #define I3C_STM32_INIT(index)                                                                      \
 	STM32_I3C_IRQ_HANDLER_DECL(index);                                                         \
-																								   \
+                                                                                                   \
 	static const struct stm32_pclken pclken_##index[] = STM32_DT_INST_CLOCKS(index);           \
 	PINCTRL_DT_INST_DEFINE(index);                                                             \
 	static struct i3c_device_desc i3c_stm32_dev_arr_##index[] =                                \
 		I3C_DEVICE_ARRAY_DT_INST(index);                                                   \
 	static struct i3c_i2c_device_desc i3c_i2c_stm32_dev_arr_##index[] =                        \
 		I3C_I2C_DEVICE_ARRAY_DT_INST(index);                                               \
-																								   \
+                                                                                                   \
 	static const struct i3c_stm32_config i3c_stm32_cfg_##index = {                             \
 		.i3c = (I3C_TypeDef *)DT_INST_REG_ADDR(index),                                     \
 		STM32_I3C_IRQ_HANDLER_FUNCTION(index).pclken = pclken_##index,                     \
@@ -1274,17 +1832,21 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 		.drv_cfg.dev_list.i2c = i3c_i2c_stm32_dev_arr_##index,                             \
 		.drv_cfg.dev_list.num_i2c = ARRAY_SIZE(i3c_i2c_stm32_dev_arr_##index),             \
 	};                                                                                         \
-																								   \
+                                                                                                   \
 	static struct i3c_stm32_data i3c_stm32_data_##index = {                                    \
 		.drv_data.ctrl_config.scl.i2c = DT_INST_PROP_OR(index, i2c_scl_hz, 0),             \
 		.drv_data.ctrl_config.scl.i3c = DT_INST_PROP_OR(index, i3c_scl_hz, 0),             \
-	};                                                                                         \
-																								   \
+		STM32_I3C_DMA_CHANNEL(index, rx, RX, PERIPHERAL, MEMORY)                           \
+			STM32_I3C_DMA_CHANNEL(index, tx, TX, MEMORY, PERIPHERAL)                   \
+				STM32_I3C_DMA_CHANNEL(index, tc, TC, MEMORY, PERIPHERAL)           \
+					STM32_I3C_DMA_CHANNEL(index, rs, RS, PERIPHERAL, MEMORY)}; \
+                                                                                                   \
 	PM_DEVICE_DT_INST_DEFINE(index, i3c_stm32_pm_action);                                      \
-																								   \
+                                                                                                   \
 	DEVICE_DT_INST_DEFINE(index, &i3c_stm32_init, PM_DEVICE_DT_INST_GET(index),                \
-				  &i3c_stm32_data_##index, &i3c_stm32_cfg_##index, POST_KERNEL,        \
-				  CONFIG_I3C_INIT_PRIORITY, &i3c_stm32_driver_api);                    \
-																								   \
+			      &i3c_stm32_data_##index, &i3c_stm32_cfg_##index, POST_KERNEL,        \
+			      CONFIG_I3C_INIT_PRIORITY, &i3c_stm32_driver_api);                    \
+                                                                                                   \
 	STM32_I3C_IRQ_HANDLER(index)
+
 DT_INST_FOREACH_STATUS_OKAY(I3C_STM32_INIT)
