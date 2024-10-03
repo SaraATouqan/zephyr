@@ -50,6 +50,17 @@ K_HEAP_DEFINE(stm32_i3c_fifo_heap, CONFIG_I3C_STM32_DMA_FIFO_HEAP_SIZE);
 
 typedef void (*irq_config_func_t)(const struct device *port);
 
+enum i3c_stm32_sf_state {
+	STM32_I3C_SF_DAA,    /* Dynamic addressing state */
+	STM32_I3C_SF_CCC,    /* First part of CCC command state*/
+	STM32_I3C_SF_CCC_P2, /* Second part of CCC command state (used for direct commands)*/
+	STM32_I3C_SF,        /* Private msg state */
+	STM32_I2C_SF,        /* I2C legacy msg state */
+	STM32_I3C_SF_IDLE,   /* Idle bus state */
+	STM32_I3C_SF_ERR,    /* Error state */
+	STM32_I3C_SF_INVAL,  /* Invalid state */
+};
+
 enum i3c_stm32_msg_state {
 	STM32_I3C_MSG_DAA,    /* Dynamic addressing state */
 	STM32_I3C_MSG_CCC,    /* First part of CCC command state*/
@@ -74,6 +85,26 @@ struct i3c_stm32_dma_stream {
 };
 #endif
 
+/* Struct to hold the information about the current message on the bus */
+struct i3c_stm32_msg {
+	uint8_t target_addr;         /* Current target xfer address */
+	struct i3c_msg *i3c_msg_ptr; /* Pointer to the current private message to send on the bus */
+	struct i3c_msg *i3c_msg_ctrl_ptr;   /* Pointer to the private message that will be used by
+						     the control FIFO */
+	struct i3c_msg *i3c_msg_status_ptr; /* Pointer to the private message that will be used by
+						   the status FIFO */
+	struct i2c_msg *i2c_msg_ptr; /* Pointer to the current legacy message to send on the bus */
+	struct i2c_msg *i2c_msg_ctrl_ptr; /* Pointer to the I2C legavy message that will be used
+						   by the control FIFO */
+	size_t num_msgs;                  /* Number of messages */
+	size_t ctrl_msg_idx;              /* Current control message index */
+	size_t status_msg_idx;            /* Current status message index */
+	size_t xfer_msg_idx;              /* Current trasnfer message index */
+	size_t xfer_offset;               /* Current message transfer offset */
+	uint32_t msg_type;                /* Either LL_I3C_CONTROLLER_MTYPE_PRIVATE or
+					     LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C */
+};
+
 struct i3c_stm32_config {
 	struct i3c_driver_config drv_cfg;      /* I3C driver config */
 	I3C_TypeDef *i3c;                      /* Pointer to I3C module base addr */
@@ -85,25 +116,20 @@ struct i3c_stm32_config {
 struct i3c_stm32_data {
 	struct i3c_driver_data drv_data;     /* I3C driver data */
 	enum i3c_stm32_msg_state msg_state;  /* Current I3C bus state */
+	enum i3c_stm32_sf_state sf_state;    /* Current I3C status FIFO state */
 	struct i3c_ccc_payload *ccc_payload; /* Current CCC message payload */
 	struct i3c_ccc_target_payload *
 		ccc_target_payload; /* Current target addressed by 2nd part of direct CCC command */
-	size_t ccc_target_idx;      /* Current target index, used for filling C-FIFO */
-	struct k_sem device_sync_sem; /* Sync between device communication messages */
-	struct k_sem bus_mutex;       /* Sync between transfers */
-	uint8_t target_addr;          /* Current target xfer address */
-	struct i3c_msg
-		*current_i3c_msg; /* Pointer to the current private message to send on the bus */
-	struct i3c_msg *current_i3c_msg_cf; /* Pointer to the private message that will be used by
-						   the control FIFO */
-	struct i3c_msg *current_i3c_msg_sf; /* Pointer to the private message that will be used by
-						   the status FIFO */
-	struct i2c_msg
-		*current_i2c_msg; /* Pointer to the current legacy message to send on the bus */
-	struct i2c_msg *current_i2c_msg_cf; /* Pointer to the I2C legavy message that will be used
-						   by the control FIFO */
-	size_t current_msg_idx;             /* Current message transfer index */
-	uint8_t num_msgs;                   /* Number of messages to send on bus */
+	struct i3c_ccc_target_payload
+		*ccc_target_payload_sf; /* Current target addressed by 2nd part of direct CCC
+					   command used by the status FIFO */
+	size_t ccc_target_idx;          /* Current target index, used for filling C-FIFO */
+	struct k_sem device_sync_sem;   /* Sync between device communication messages */
+	struct k_sem bus_mutex;         /* Sync between transfers */
+	struct i3c_stm32_msg curr_msg;
+	uint8_t target_addr;    /* Current target xfer address */
+	size_t current_msg_idx; /* Current message transfer index */
+	uint8_t num_msgs;       /* Number of messages to send on bus */
 #ifdef CONFIG_I3C_STM32_DMA
 	struct i3c_stm32_dma_stream dma_rx; /* RX DMA channel config */
 	struct i3c_stm32_dma_stream dma_tx; /* TX DMA channel config */
@@ -127,6 +153,217 @@ struct i3c_stm32_data {
 	struct k_sem ibi_lock_sem; /* Semaphore used for ibi requests */
 #endif
 };
+
+static int i3c_stm32_curr_msg_init(const struct device *dev, struct i3c_msg *i3c_msgs,
+				   struct i2c_msg *i2c_msgs, uint8_t num_msgs, uint8_t tgt_addr)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	/* Either should be NULL */
+	if ((i3c_msgs == NULL && i2c_msgs == NULL) || (i3c_msgs != NULL && i2c_msgs != NULL)) {
+		return -EINVAL;
+	}
+
+	curr_msg->target_addr = tgt_addr;
+	curr_msg->xfer_offset = 0;
+	curr_msg->num_msgs = num_msgs;
+	curr_msg->ctrl_msg_idx = 0;
+	curr_msg->status_msg_idx = 0;
+	curr_msg->xfer_msg_idx = 0;
+
+	/* I3C private message */
+	if (i2c_msgs == NULL) {
+		curr_msg->msg_type = LL_I3C_CONTROLLER_MTYPE_PRIVATE;
+		curr_msg->i3c_msg_ptr = i3c_msgs;
+		curr_msg->i3c_msg_ctrl_ptr = i3c_msgs;
+		curr_msg->i3c_msg_status_ptr = i3c_msgs;
+	} else {
+		/* Legacy I2C message */
+		curr_msg->msg_type = LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C;
+		curr_msg->i2c_msg_ptr = i2c_msgs;
+		curr_msg->i2c_msg_ctrl_ptr = i2c_msgs;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_curr_msg_init_i3c(const struct device *dev, struct i3c_msg *i3c_msgs,
+				       uint8_t num_msgs, uint8_t tgt_addr)
+{
+	return i3c_stm32_curr_msg_init(dev, i3c_msgs, NULL, num_msgs, tgt_addr);
+}
+
+static int i3c_stm32_curr_msg_init_i2c(const struct device *dev, struct i2c_msg *i2c_msgs,
+				       uint8_t num_msgs, uint8_t tgt_addr)
+{
+	return i3c_stm32_curr_msg_init(dev, NULL, i2c_msgs, num_msgs, tgt_addr);
+}
+
+static bool i3c_stm32_curr_msg_is_i3c(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	return (curr_msg->msg_type == LL_I3C_CONTROLLER_MTYPE_PRIVATE);
+}
+
+static int i3c_stm32_curr_msg_control_get_dir(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		return (((curr_msg->i3c_msg_ctrl_ptr->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
+				? LL_I3C_DIRECTION_READ
+				: LL_I3C_DIRECTION_WRITE);
+	}
+
+	return (((curr_msg->i2c_msg_ctrl_ptr->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ)
+			? LL_I3C_DIRECTION_READ
+			: LL_I3C_DIRECTION_WRITE);
+}
+
+static int i3c_stm32_curr_msg_control_get_len(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	return (i3c_stm32_curr_msg_is_i3c(dev)) ? curr_msg->i3c_msg_ctrl_ptr->len
+						: curr_msg->i2c_msg_ctrl_ptr->len;
+}
+
+static int i3c_stm32_curr_msg_control_get_end(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	return ((curr_msg->ctrl_msg_idx < (curr_msg->num_msgs - 1)) ? LL_I3C_GENERATE_RESTART
+								    : LL_I3C_GENERATE_STOP);
+}
+
+static int i3c_stm32_curr_msg_control_next(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->ctrl_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return -EFAULT;
+	}
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		curr_msg->i3c_msg_ctrl_ptr++;
+	} else {
+		curr_msg->i2c_msg_ctrl_ptr++;
+	}
+
+	curr_msg->ctrl_msg_idx++;
+
+	return 0;
+}
+
+static int i3c_stm32_curr_msg_status_update_num_xfer(const struct device *dev, size_t num_xfer)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->status_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return -EFAULT;
+	}
+
+	/* Legacy I2C messages do not have num_xfer */
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		curr_msg->i3c_msg_status_ptr->num_xfer = num_xfer;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_curr_msg_status_next(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->status_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return -EFAULT;
+	}
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		curr_msg->i3c_msg_status_ptr++;
+		curr_msg->status_msg_idx++;
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_curr_msg_xfer_get_buf(const struct device *dev, uint8_t **buf, uint32_t *len,
+					   size_t **offset)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->xfer_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return -EFAULT;
+	}
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		*buf = curr_msg->i3c_msg_ptr->buf;
+		*len = curr_msg->i3c_msg_ptr->len;
+	} else {
+		*buf = curr_msg->i2c_msg_ptr->buf;
+		*len = curr_msg->i2c_msg_ptr->len;
+	}
+
+	*offset = &curr_msg->xfer_offset;
+
+	return 0;
+}
+
+/* This method is only used in DMA mode */
+#ifdef CONFIG_I3C_STM32_DMA
+static bool i3c_stm32_curr_msg_xfer_is_read(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->xfer_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return false;
+	}
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		return ((curr_msg->i3c_msg_ptr->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ);
+	}
+
+	return ((curr_msg->i2c_msg_ptr->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ);
+}
+#endif /* CONFIG_I3C_STM32_DMA */
+
+static int i3c_stm32_curr_msg_xfer_next(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	if (curr_msg->xfer_msg_idx >= curr_msg->num_msgs) {
+		LOG_ERR("No more messages left");
+		return -EFAULT;
+	}
+
+	if (i3c_stm32_curr_msg_is_i3c(dev)) {
+		curr_msg->i3c_msg_ptr++;
+	} else {
+		curr_msg->i2c_msg_ptr++;
+	}
+
+	curr_msg->xfer_msg_idx++;
+	curr_msg->xfer_offset = 0;
+
+	return 0;
+}
 
 /* Activates the device I3C pinctrl and CLK */
 static int i3c_stm32_activate(const struct device *dev)
@@ -339,8 +576,6 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 	LL_I3C_SetDataHoldTime(i3c, LL_I3C_SDA_HOLD_TIME_1_5);
 	LL_I3C_SetControllerActivityState(i3c, LL_I3C_OWN_ACTIVITY_STATE_0);
 
-	/* Timing currently works on 120 MHz on ABP1 */
-
 	ret = i3c_stm32_config_clk_wave(dev);
 	if (ret != 0) {
 		LOG_ERR("TimigReg0 timing could not be calculated, err=%d", ret);
@@ -375,6 +610,7 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 
 	LL_I3C_Enable(i3c);
 
+#ifndef CONFIG_I3C_STM32_POLL
 	LL_I3C_EnableIT_FC(i3c);
 	LL_I3C_EnableIT_CFNF(i3c);
 	LL_I3C_EnableIT_SFNE(i3c);
@@ -382,6 +618,8 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 	LL_I3C_EnableIT_TXFNF(i3c);
 	LL_I3C_EnableIT_ERR(i3c);
 	LL_I3C_EnableIT_WKP(i3c);
+#endif /* CONFIG_I3C_STM32_POLL */
+
 #ifdef CONFIG_I3C_USE_IBI
 	LL_I3C_EnableIT_IBI(i3c);
 	LL_I3C_EnableIT_HJ(i3c);
@@ -389,6 +627,7 @@ static int i3c_stm32_configure(const struct device *dev, enum i3c_config_type ty
 
 	/* Bus will be idle initially */
 	data->msg_state = STM32_I3C_MSG_IDLE;
+	data->sf_state = STM32_I3C_SF_IDLE;
 	data->target_id = 0;
 #ifdef CONFIG_I3C_USE_IBI
 	data->ibi_payload = 0;
@@ -465,7 +704,7 @@ static void i3c_stm32_prepare_dma_requests(const struct device *dev)
 	LL_I3C_EnableDMAReq_Status(i3c);
 }
 
-#endif
+#endif /* CONFIG_I3C_STM32_DMA */
 
 static void i3c_stm32_flush_all_fifo(const struct device *dev)
 {
@@ -476,6 +715,45 @@ static void i3c_stm32_flush_all_fifo(const struct device *dev)
 	LL_I3C_RequestRxFIFOFlush(i3c);
 	LL_I3C_RequestControlFIFOFlush(i3c);
 	LL_I3C_RequestStatusFIFOFlush(i3c);
+}
+
+static void i3c_stm32_log_err_type(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
+	if (LL_I3C_IsActiveFlag_ANACK(i3c)) {
+		LOG_ERR("Address NACK");
+	}
+
+	if (LL_I3C_IsActiveFlag_COVR(i3c)) {
+		LOG_ERR("Control/Status FIFO underrun/overrun");
+	}
+
+	if (LL_I3C_IsActiveFlag_DOVR(i3c)) {
+		LOG_ERR("TX/RX FIFO underrun/overrun");
+	}
+
+	if (LL_I3C_IsActiveFlag_DNACK(i3c)) {
+		LOG_ERR("Data NACK by target");
+	}
+
+	if (LL_I3C_IsActiveFlag_PERR(i3c)) {
+		switch (LL_I3C_GetMessageErrorCode(i3c)) {
+		case LL_I3C_CONTROLLER_ERROR_CE0:
+			LOG_ERR("Illegally formatted CCC detected");
+			break;
+		case LL_I3C_CONTROLLER_ERROR_CE1:
+			LOG_ERR("Data on bus is not as expected");
+			break;
+		case LL_I3C_CONTROLLER_ERROR_CE2:
+			LOG_ERR("No response to broadcast address");
+			break;
+		default:
+			LOG_ERR("Unsupported error detected");
+			break;
+		}
+	}
 }
 
 static void i3c_stm32_clear_err(const struct device *dev, bool is_i2c_xfer)
@@ -499,9 +777,241 @@ static void i3c_stm32_clear_err(const struct device *dev, bool is_i2c_xfer)
 #endif
 
 	data->msg_state = STM32_I3C_MSG_IDLE;
+	data->sf_state = STM32_I3C_SF_IDLE;
 
 	k_sem_give(&data->bus_mutex);
 }
+
+/**
+ * @brief Fills the I3C TX FIFO from a given buffer
+ *
+ * @param buf The buffer to fill the TX FIFO from
+ * @param len The total buffer length
+ * @param offset Pointer to the offset from the beginning of buffer which will be incremented by the
+ * number of bytes sent to the TX FIFO
+ *
+ * @return Returns true if last byte was sent (TXLAST flag was set)
+ */
+static size_t i3c_stm32_fill_tx_fifo(const struct device *dev, uint8_t *buf, size_t len,
+				     size_t *offset)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+	bool is_last = false;
+
+	if (*offset >= len) {
+		return 0;
+	}
+
+	while (LL_I3C_IsActiveFlag_TXFNF(i3c)) {
+		if (LL_I3C_IsActiveFlag_TXLAST(i3c)) {
+			is_last = true;
+		}
+
+		if (*offset < len) {
+			LL_I3C_TransmitData8(i3c, buf[(*offset)++]);
+		}
+
+		if (is_last) {
+			return is_last;
+		}
+	}
+
+	return is_last;
+}
+
+/**
+ * @brief Fills the I3C TX FIFO from a given buffer
+ *
+ * @param buf The buffer to drain the RX FIFO to
+ * @param len The total buffer length
+ * @param offset Pointer to the offset from the beginning of buffer which will be incremented by the
+ * number of bytes drained from the RX FIFO
+ *
+ * @return Returns true if last byte was received (RXLAST flag was set)
+ */
+static size_t i3c_stm32_drain_rx_fifo(const struct device *dev, uint8_t *buf, uint32_t len,
+				      size_t *offset)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+	bool is_last = false;
+
+	if (*offset >= len) {
+		return 0;
+	}
+
+	while (LL_I3C_IsActiveFlag_RXFNE(i3c)) {
+		if (LL_I3C_IsActiveFlag_RXLAST(i3c)) {
+			is_last = true;
+		}
+
+		if (*offset < len) {
+			buf[(*offset)++] = LL_I3C_ReceiveData8(i3c);
+		}
+
+		if (is_last) {
+			return is_last;
+		}
+	}
+
+	return is_last;
+}
+
+#ifdef CONFIG_I3C_STM32_POLL
+
+static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *payload)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	I3C_TypeDef *i3c = config->i3c;
+
+	if (dev == NULL || payload == NULL) {
+		return -EINVAL;
+	}
+
+	if (payload->ccc.id == I3C_CCC_ENTDAA) {
+		return -EINVAL;
+	}
+
+	/* Check if payload has targets when sending a direct CCC */
+	if (!i3c_ccc_is_payload_broadcast(payload) &&
+	    (payload->targets.payloads == NULL || payload->targets.num_targets == 0)) {
+		return -EINVAL;
+	}
+
+	if (payload->ccc.data_len > 0 && payload->ccc.data == NULL) {
+		return -EINVAL;
+	}
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	(void)pm_device_runtime_get(dev);
+#endif
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
+	/* Mark current transfer as CCC */
+	data->msg_state = STM32_I3C_MSG_CCC;
+	data->sf_state = STM32_I3C_SF_CCC;
+	data->ccc_payload = payload;
+	data->ccc_target_idx = 0;
+	data->ccc_target_payload = payload->targets.payloads;
+	data->ccc_target_payload_sf = payload->targets.payloads;
+	data->current_msg_idx = 0;
+
+	payload->ccc.num_xfer = 0;
+
+	for (size_t i = 0; i < payload->targets.num_targets; i++) {
+		payload->targets.payloads->num_xfer = 0;
+	}
+
+	bool is_done = false;
+
+	/* Start CCC transfer */
+	LL_I3C_ControllerHandleCCC(i3c, payload->ccc.id, payload->ccc.data_len,
+				   (i3c_ccc_is_payload_broadcast(payload)
+					    ? LL_I3C_GENERATE_STOP
+					    : LL_I3C_GENERATE_RESTART));
+
+	while (!is_done) {
+		if (LL_I3C_IsActiveFlag_ERR(i3c)) {
+			i3c_stm32_log_err_type(dev);
+			LL_I3C_ClearFlag_ERR(i3c);
+			k_sem_give(&data->bus_mutex);
+			return -EIO;
+		}
+
+		/* Triggers only on the second part of CCC during direct CCC messages */
+		if (LL_I3C_IsActiveFlag_CFNF(i3c)) {
+			struct i3c_ccc_payload *curr_payload = data->ccc_payload;
+			struct i3c_ccc_target_payload *target;
+
+			if (data->ccc_target_idx < curr_payload->targets.num_targets) {
+				target = &curr_payload->targets.payloads[data->ccc_target_idx++];
+
+				LL_I3C_ControllerHandleMessage(
+					i3c, target->addr, target->data_len,
+					target->rnw ? LL_I3C_DIRECTION_READ
+						    : LL_I3C_DIRECTION_WRITE,
+					LL_I3C_CONTROLLER_MTYPE_DIRECT,
+					(data->ccc_target_idx == curr_payload->targets.num_targets)
+						? LL_I3C_GENERATE_STOP
+						: LL_I3C_GENERATE_RESTART);
+			}
+		}
+
+		/* Read and fill num_xfer for each transfer from status FIFO */
+		if (LL_I3C_IsActiveFlag_SFNE(i3c)) {
+			if (data->sf_state == STM32_I3C_SF_CCC) {
+				struct i3c_ccc_payload *curr_payload = data->ccc_payload;
+
+				curr_payload->ccc.num_xfer = LL_I3C_GetXferDataCount(i3c);
+				data->sf_state = STM32_I3C_SF_CCC_P2;
+
+			} else if (data->sf_state == STM32_I3C_SF_CCC_P2) {
+				data->ccc_target_payload_sf->num_xfer =
+					LL_I3C_GetXferDataCount(i3c);
+				data->ccc_target_payload_sf++;
+			}
+		}
+
+		/* Should only trigger on second part of CCC direct message (read) */
+		if (LL_I3C_IsActiveFlag_RXFNE(i3c)) {
+			struct i3c_ccc_target_payload *target = data->ccc_target_payload;
+
+			/* After receiving all bytes for current target, move on to the next
+			 * target
+			 */
+			if (i3c_stm32_drain_rx_fifo(dev, target->data, target->data_len,
+						    &data->current_msg_idx)) {
+				data->current_msg_idx = 0;
+
+				data->ccc_target_payload++;
+				break;
+			}
+		}
+
+		if (LL_I3C_IsActiveFlag_TXFNF(i3c)) {
+			if (data->msg_state == STM32_I3C_MSG_CCC) {
+				struct i3c_ccc_payload *curr_payload = data->ccc_payload;
+
+				if (i3c_stm32_fill_tx_fifo(dev, curr_payload->ccc.data,
+							   curr_payload->ccc.data_len,
+							   &data->current_msg_idx)) {
+					data->current_msg_idx = 0;
+
+					/* Change state to second part of CCC communication */
+					data->msg_state = STM32_I3C_MSG_CCC_P2;
+				}
+
+			} else if (data->msg_state == STM32_I3C_MSG_CCC_P2) {
+				struct i3c_ccc_target_payload *target = data->ccc_target_payload;
+
+				if (i3c_stm32_fill_tx_fifo(dev, target->data, target->data_len,
+							   &data->current_msg_idx)) {
+					data->current_msg_idx = 0;
+
+					data->ccc_target_payload++;
+					break;
+				}
+			}
+		}
+
+		if (LL_I3C_IsActiveFlag_FC(i3c)) {
+			is_done = true;
+			data->msg_state = STM32_I3C_MSG_IDLE;
+			LL_I3C_ClearFlag_FC(i3c);
+		}
+	}
+
+	k_sem_give(&data->bus_mutex);
+
+	return 0;
+}
+
+#else /* CONFIG_I3C_STM32_POLL */
 
 /* Handles broadcast/direct CCCs except for ENTDAA */
 static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *payload)
@@ -570,6 +1080,110 @@ static int i3c_stm32_do_ccc(const struct device *dev, struct i3c_ccc_payload *pa
 	return 0;
 }
 
+#endif /* CONFIG_I3C_STM32_POLL */
+
+#ifdef CONFIG_I3C_STM32_POLL
+
+/* Handles the ENTDAA CCC */
+static int i3c_stm32_do_daa(const struct device *dev)
+{
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_data *data = dev->data;
+	I3C_TypeDef *i3c = config->i3c;
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	(void)pm_device_runtime_get(dev);
+#endif
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
+	/* Mark current transfer as DAA */
+	data->msg_state = STM32_I3C_MSG_DAA;
+
+	bool is_done = false;
+
+	/* Start DAA */
+	LL_I3C_ControllerHandleCCC(i3c, I3C_CCC_ENTDAA, 0, LL_I3C_GENERATE_STOP);
+
+	while (!is_done) {
+		if (LL_I3C_IsActiveFlag_ERR(i3c)) {
+			i3c_stm32_log_err_type(dev);
+			LL_I3C_ClearFlag_ERR(i3c);
+			k_sem_give(&data->bus_mutex);
+			return -EIO;
+		}
+
+		/* Read and discard status word from status FIFO since it is not used */
+		if (LL_I3C_IsActiveFlag_SFNE(i3c)) {
+			uint32_t status_reg = i3c->SR;
+			ARG_UNUSED(status_reg);
+		}
+
+		if (LL_I3C_IsActiveFlag_RXFNE(i3c)) {
+			i3c_stm32_drain_rx_fifo(dev, (uint8_t *)&data->pid, sizeof(data->pid),
+						&data->daa_rx_rcv);
+		}
+
+		if (LL_I3C_IsActiveFlag_TXFNF(i3c) && data->daa_rx_rcv == 8) {
+			struct i3c_device_desc *target;
+			uint8_t bcr;
+			uint8_t dcr;
+			uint8_t dyn_addr = 0;
+			int ret;
+
+			data->daa_rx_rcv = 0;
+
+			bcr = (data->pid >> 8) & 0xFF;
+			dcr = data->pid & 0xFF;
+			data->pid >>= 16;
+
+			/* Find the device in the device list */
+			ret = i3c_dev_list_daa_addr_helper(&data->drv_data.attached_dev.addr_slots,
+							   &config->drv_cfg.dev_list, data->pid,
+							   false, false, &target, &dyn_addr);
+			if (ret != 0) {
+				LOG_ERR("No dynamic address could be assigned to target");
+				/* Let the error flag handle the error, expected TX FIFO underrun */
+				continue;
+			}
+
+			/* Put the new dynamic address in TX FIFO for transmission */
+			LL_I3C_TransmitData8(i3c, dyn_addr);
+
+			if (target != NULL) {
+				/* Update target descriptor */
+				target->dynamic_addr = dyn_addr;
+				target->bcr = bcr;
+				target->dcr = dcr;
+			}
+
+			/* Mark the address as used */
+			i3c_addr_slots_mark_i3c(&data->drv_data.attached_dev.addr_slots, dyn_addr);
+
+			/* Mark the static address as free */
+			if ((target != NULL) && (target->static_addr != 0) &&
+			    (dyn_addr != target->static_addr)) {
+				i3c_addr_slots_mark_free(&data->drv_data.attached_dev.addr_slots,
+							 dyn_addr);
+			}
+		}
+
+		if (LL_I3C_IsActiveFlag_FC(i3c)) {
+			is_done = true;
+			data->msg_state = STM32_I3C_MSG_IDLE;
+			LL_I3C_ClearFlag_FC(i3c);
+		}
+	}
+
+	k_sem_give(&data->bus_mutex);
+
+	return 0;
+}
+
+#else /* CONFIG_I3C_STM32_POLL */
+
 /* Handles the ENTDAA CCC */
 static int i3c_stm32_do_daa(const struct device *dev)
 {
@@ -612,6 +1226,8 @@ static int i3c_stm32_do_daa(const struct device *dev)
 
 	return 0;
 }
+
+#endif /* CONFIG_I3C_STM32_POLL */
 
 #ifdef CONFIG_I3C_STM32_DMA
 
@@ -705,27 +1321,104 @@ static int i3c_stm32_dma_msg_config(const struct device *dev, uint32_t buf_addr,
 	return 0;
 }
 
-static int i3c_stm32_dma_i3c_msg_config(const struct device *dev, struct i3c_msg *msg)
-{
-	return i3c_stm32_dma_msg_config(dev, (uint32_t)msg->buf, msg->len,
-					((msg->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ));
-}
-
-static int i3c_stm32_dma_i2c_msg_config(const struct device *dev, struct i2c_msg *msg)
-{
-	return i3c_stm32_dma_msg_config(dev, (uint32_t)msg->buf, msg->len,
-					((msg->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ));
-}
-
 #endif
 
-/* Handles the controller private read/write transfers */
-static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *target,
-			      struct i3c_msg *msgs, uint8_t num_msgs)
+#ifdef CONFIG_I3C_STM32_POLL
+
+static int i3c_stm32_transfer_handle_fifo(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+	I3C_TypeDef *i3c = config->i3c;
+	bool is_done = false;
+
+	while (!is_done) {
+		if (LL_I3C_IsActiveFlag_ERR(i3c)) {
+			i3c_stm32_log_err_type(dev);
+			LL_I3C_ClearFlag_ERR(i3c);
+			return -EIO;
+		}
+
+		if (LL_I3C_IsActiveFlag_CFNF(i3c)) {
+			LL_I3C_ControllerHandleMessage(
+				i3c, curr_msg->target_addr, i3c_stm32_curr_msg_control_get_len(dev),
+				i3c_stm32_curr_msg_control_get_dir(dev), curr_msg->msg_type,
+				i3c_stm32_curr_msg_control_get_end(dev));
+
+			i3c_stm32_curr_msg_control_next(dev);
+		}
+
+		if (LL_I3C_IsActiveFlag_SFNE(i3c)) {
+			size_t num_xfer = LL_I3C_GetXferDataCount(i3c);
+
+			i3c_stm32_curr_msg_status_update_num_xfer(dev, num_xfer);
+			i3c_stm32_curr_msg_status_next(dev);
+		}
+
+		if (LL_I3C_IsActiveFlag_RXFNE(i3c)) {
+			uint8_t *buf = NULL;
+			size_t *offset = NULL;
+			uint32_t len = 0;
+
+			i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+			if (i3c_stm32_drain_rx_fifo(dev, buf, len, offset)) {
+				i3c_stm32_curr_msg_xfer_next(dev);
+			}
+		}
+
+		if (LL_I3C_IsActiveFlag_TXFNF(i3c)) {
+			uint8_t *buf = NULL;
+			size_t *offset = NULL;
+			uint32_t len = 0;
+
+			i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+			if (i3c_stm32_fill_tx_fifo(dev, buf, len, offset)) {
+				i3c_stm32_curr_msg_xfer_next(dev);
+			}
+		}
+
+		if (LL_I3C_IsActiveFlag_FC(i3c)) {
+			is_done = true;
+			data->msg_state = STM32_I3C_MSG_IDLE;
+			LL_I3C_ClearFlag_FC(i3c);
+		}
+	}
+
+	return 0;
+}
+
+static int i3c_stm32_transfer_begin(const struct device *dev)
 {
 	struct i3c_stm32_data *data = dev->data;
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
+
+	data->msg_state = STM32_I3C_MSG;
+	data->sf_state = STM32_I3C_SF;
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	(void)pm_device_runtime_get(dev);
+#endif
+
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
+	/* Begin transmission */
+	LL_I3C_RequestTransfer(i3c);
+
+	/* Continue data transmission until the end of transfer */
+	return i3c_stm32_transfer_handle_fifo(dev);
+}
+
+/* Handles the controller private read/write transfers */
+static int i3c_stm32_i3c_transfer(const struct device *dev, struct i3c_device_desc *target,
+				  struct i3c_msg *msgs, uint8_t num_msgs)
+{
+	struct i3c_stm32_data *data = dev->data;
+	int ret;
 
 	/* Verify all messages */
 	for (size_t i = 0; i < num_msgs; i++) {
@@ -736,8 +1429,125 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 
+	ret = i3c_stm32_curr_msg_init_i3c(dev, msgs, num_msgs, target->dynamic_addr);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
+		return ret;
+	}
+
+	ret = i3c_stm32_transfer_begin(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to transfer messages, err=%d", ret);
+		return ret;
+	}
+
+	k_sem_give(&data->bus_mutex);
+
+	return 0;
+}
+
+static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
+				  uint16_t addr)
+{
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+	int ret;
+
+	if (addr > 0x7f) {
+		LOG_ERR("This device only supports 7-bit addressing mode");
+		return -EINVAL;
+	}
+
+	/* Verify all messages */
+	for (size_t i = 0; i < num_msgs; i++) {
+		if (msgs[i].buf == NULL) {
+			return -EINVAL;
+		}
+	}
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+	LL_I3C_DisableArbitrationHeader(i3c);
+
+	ret = i3c_stm32_curr_msg_init_i2c(dev, msgs, num_msgs, addr);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
+		return ret;
+	}
+
+	ret = i3c_stm32_transfer_begin(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to transfer messages, err=%d", ret);
+		return ret;
+	}
+
+	LL_I3C_EnableArbitrationHeader(i3c);
+	k_sem_give(&data->bus_mutex);
+
+	return 0;
+}
+
+#else /* CONFIG_I3C_STM32_POLL */
+
+static int i3c_stm32_transfer_begin(const struct device *dev)
+{
+	struct i3c_stm32_data *data = dev->data;
+	const struct i3c_stm32_config *config = dev->config;
+	I3C_TypeDef *i3c = config->i3c;
+
 	data->msg_state = STM32_I3C_MSG;
-	data->target_addr = target->dynamic_addr;
+	data->sf_state = STM32_I3C_SF;
+
+#ifdef CONFIG_I3C_STM32_DMA
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
+
+	data->fifo_len = curr_msg->num_msgs * sizeof(uint32_t);
+	data->control_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	data->status_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
+	int ret;
+
+	/* Prepare all control words for all messages on the transfer */
+	for (size_t i = 0; i < curr_msg->num_msgs; i++) {
+		WRITE_REG(data->control_fifo[i],
+			  ((curr_msg->target_addr << I3C_CR_ADD_Pos) |
+			   i3c_stm32_curr_msg_control_get_len(dev) |
+			   i3c_stm32_curr_msg_control_get_dir(dev) | curr_msg->msg_type |
+			   i3c_stm32_curr_msg_control_get_end(dev)) &
+				  (I3C_CR_ADD | I3C_CR_DCNT | I3C_CR_RNW | I3C_CR_MTYPE |
+				   I3C_CR_MEND));
+
+		i3c_stm32_curr_msg_control_next(dev);
+	}
+
+	/* Configure DMA for the first message only, DMA callback will take care of the rest */
+	uint8_t *buf = NULL;
+	size_t *offset = 0;
+	uint32_t len = 0;
+
+	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+	ret = i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len,
+				       i3c_stm32_curr_msg_xfer_is_read(dev));
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_control_fifo_config(dev);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = i3c_stm32_dma_msg_status_fifo_config(dev);
+	if (ret != 0) {
+		return ret;
+	}
+
+	i3c_stm32_prepare_dma_requests(dev);
+#endif
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
 	(void)pm_device_runtime_get(dev);
@@ -746,64 +1556,48 @@ static int i3c_stm32_transfer(const struct device *dev, struct i3c_device_desc *
 	/* Prevent the clocks to be stopped during the transaction */
 	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
-	data->current_i3c_msg_cf = &msgs[0];
-	data->current_i3c_msg_sf = &msgs[0];
-	data->current_i3c_msg = &msgs[0];
-	data->current_msg_idx = 0;
-	data->num_msgs = num_msgs;
-
-#ifdef CONFIG_I3C_STM32_DMA
-	data->fifo_len = num_msgs * sizeof(uint32_t);
-	data->control_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
-	data->status_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
-	int ret;
-
-	/* Prepare all control words for all messages on the transfer */
-	for (size_t i = 0; i < num_msgs; i++) {
-		WRITE_REG(data->control_fifo[i],
-			  ((data->target_addr << I3C_CR_ADD_Pos) | msgs[i].len |
-			   (((msgs[i].flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
-				    ? LL_I3C_DIRECTION_READ
-				    : LL_I3C_DIRECTION_WRITE) |
-			   LL_I3C_CONTROLLER_MTYPE_PRIVATE |
-			   ((i < num_msgs - 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP)) &
-				  (I3C_CR_ADD | I3C_CR_DCNT | I3C_CR_RNW | I3C_CR_MTYPE |
-				   I3C_CR_MEND));
-	}
-
-	/* Configure DMA for the first message only, DMA callback will take care of the rest */
-	ret = i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
-	if (ret != 0) {
-		i3c_stm32_clear_err(dev, false);
-		return ret;
-	}
-
-	ret = i3c_stm32_dma_msg_control_fifo_config(dev);
-	if (ret != 0) {
-		i3c_stm32_clear_err(dev, false);
-		return ret;
-	}
-
-	ret = i3c_stm32_dma_msg_status_fifo_config(dev);
-	if (ret != 0) {
-		i3c_stm32_clear_err(dev, false);
-		return ret;
-	}
-
-	i3c_stm32_prepare_dma_requests(dev);
-#endif
-
+	/* Begin transmission */
 	LL_I3C_RequestTransfer(i3c);
 
 	/* Wait for whole transfer to complete */
 	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-		i3c_stm32_clear_err(dev, false);
 		return -ETIMEDOUT;
 	}
 
 	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev, false);
 		return -EIO;
+	}
+
+	return 0;
+}
+
+/* Handles the controller private read/write transfers */
+static int i3c_stm32_i3c_transfer(const struct device *dev, struct i3c_device_desc *target,
+				  struct i3c_msg *msgs, uint8_t num_msgs)
+{
+	struct i3c_stm32_data *data = dev->data;
+	int ret;
+
+	/* Verify all messages */
+	for (size_t i = 0; i < num_msgs; i++) {
+		if (msgs[i].buf == NULL) {
+			return -EINVAL;
+		}
+	}
+
+	k_sem_take(&data->bus_mutex, K_FOREVER);
+	ret = i3c_stm32_curr_msg_init_i3c(dev, msgs, num_msgs, target->dynamic_addr);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
+		return ret;
+	}
+
+	ret = i3c_stm32_transfer_begin(dev);
+	if (ret != 0) {
+		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to transfer messages, err=%d", ret);
+		return ret;
 	}
 
 #ifdef CONFIG_I3C_STM32_DMA
@@ -829,6 +1623,7 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 	struct i3c_stm32_data *data = dev->data;
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
+	int ret;
 
 	if (addr > 0x7f) {
 		LOG_ERR("This device only supports 7-bit addressing mode");
@@ -844,76 +1639,21 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 
-	data->msg_state = STM32_I2C_MSG;
-	data->target_addr = addr;
-
 	/* Disable arbitration header for all I2C messages in case no I3C devices exist on bus */
 	LL_I3C_DisableArbitrationHeader(i3c);
 
-#ifdef CONFIG_PM_DEVICE_RUNTIME
-	(void)pm_device_runtime_get(dev);
-#endif
-
-	/* Prevent the clocks to be stopped during the transaction */
-	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-
-	data->current_i2c_msg_cf = &msgs[0];
-	data->current_i2c_msg = &msgs[0];
-	data->current_msg_idx = 0;
-	data->num_msgs = num_msgs;
-
-#ifdef CONFIG_I3C_STM32_DMA
-	data->fifo_len = num_msgs * sizeof(uint32_t);
-	data->control_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
-	data->status_fifo = k_heap_alloc(&stm32_i3c_fifo_heap, data->fifo_len, K_FOREVER);
-	int ret;
-
-	/* Prepare all control words for all messages on the transfer */
-	for (size_t i = 0; i < num_msgs; i++) {
-		WRITE_REG(data->control_fifo[i],
-			  ((data->target_addr << I3C_CR_ADD_Pos) | msgs[i].len |
-			   (((msgs[i].flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
-				    ? LL_I3C_DIRECTION_READ
-				    : LL_I3C_DIRECTION_WRITE) |
-			   LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C |
-			   ((i < num_msgs - 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP)) &
-				  (I3C_CR_ADD | I3C_CR_DCNT | I3C_CR_RNW | I3C_CR_MTYPE |
-				   I3C_CR_MEND));
-	}
-
-	/* Configure DMA for the first message only, DMA callback will take care of the rest */
-	ret = i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
-	if (ret != 0) {
-		i3c_stm32_clear_err(dev, true);
-		return ret;
-	}
-
-	ret = i3c_stm32_dma_msg_control_fifo_config(dev);
+	ret = i3c_stm32_curr_msg_init_i2c(dev, msgs, num_msgs, addr);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
 		return ret;
 	}
 
-	ret = i3c_stm32_dma_msg_status_fifo_config(dev);
+	ret = i3c_stm32_transfer_begin(dev);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
+		LOG_ERR("Failed to transfer messages, err=%d", ret);
 		return ret;
-	}
-
-	i3c_stm32_prepare_dma_requests(dev);
-#endif
-
-	LL_I3C_RequestTransfer(i3c);
-
-	/* Wait for current transfer to complete */
-	if (k_sem_take(&data->device_sync_sem, STM32_I3C_TRANSFER_TIMEOUT) != 0) {
-		i3c_stm32_clear_err(dev, true);
-		return -ETIMEDOUT;
-	}
-
-	if (data->msg_state == STM32_I3C_MSG_ERR) {
-		i3c_stm32_clear_err(dev, true);
-		return -EIO;
 	}
 
 	LL_I3C_EnableArbitrationHeader(i3c);
@@ -929,6 +1669,8 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 
 	return 0;
 }
+
+#endif /* CONFIG_I3C_STM32_POLL */
 
 #ifdef CONFIG_PM_DEVICE
 static int i3c_stm32_suspend(const struct device *dev)
@@ -1140,15 +1882,18 @@ static int i3c_stm32_init(const struct device *dev)
 	k_sem_init(&data->bus_mutex, 1, 1);
 
 	/* initialize semaphore used when multiple ibi requests are taking place */
+#ifdef CONFIG_I3C_USE_IBI
 	k_sem_init(&data->ibi_lock_sem, 1, 1);
-
+#endif
 	ret = i3c_addr_slots_init(dev);
 	if (ret != 0) {
 		LOG_ERR("Addr slots init fail, err=%d", ret);
 		return ret;
 	}
 
+#ifndef CONFIG_I3C_STM32_POLL
 	config->irq_config_func(dev);
+#endif /* CONFIG_I3C_STM32_POLL */
 
 	i3c_stm32_configure(dev, I3C_CONFIG_CONTROLLER, NULL);
 
@@ -1156,14 +1901,19 @@ static int i3c_stm32_init(const struct device *dev)
 	(void)pm_device_runtime_enable(dev);
 #endif
 
-	ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
-	if (ret != 0) {
-		LOG_ERR("Failed to do i3c bus init, err=%d", ret);
-		return ret;
+	/* Perform bus initialization only if there are devices that already exist on the bus */
+	if (config->drv_cfg.dev_list.num_i3c > 0) {
+		ret = i3c_bus_init(dev, &config->drv_cfg.dev_list);
+		if (ret != 0) {
+			LOG_ERR("Failed to do i3c bus init, err=%d", ret);
+			return ret;
+		}
 	}
 
 	return 0;
 }
+
+#ifndef CONFIG_I3C_STM32_POLL
 
 static void i3c_stm32_event_isr_tx(const struct device *dev)
 {
@@ -1172,39 +1922,18 @@ static void i3c_stm32_event_isr_tx(const struct device *dev)
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG: {
-		struct i3c_msg *msg = data->current_i3c_msg;
-
-		if (LL_I3C_IsActiveFlag_TXLAST(i3c)) {
-			data->current_i3c_msg++;
-		}
-
-		if (data->current_msg_idx < msg->len) {
-			LL_I3C_TransmitData8(i3c, msg->buf[data->current_msg_idx++]);
-		}
-
-		/* Reset msg_idx after moving on to the next message */
-		if (msg != data->current_i3c_msg) {
-			data->current_msg_idx = 0;
-		}
-
-		break;
-	}
+	case STM32_I3C_MSG:
 	case STM32_I2C_MSG: {
-		struct i2c_msg *msg = data->current_i2c_msg;
+		uint8_t *buf = NULL;
+		size_t *offset = NULL;
+		uint32_t len = 0;
 
-		if (LL_I3C_IsActiveFlag_TXLAST(i3c)) {
-			data->current_i2c_msg++;
+		i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+		if (i3c_stm32_fill_tx_fifo(dev, buf, len, offset)) {
+			i3c_stm32_curr_msg_xfer_next(dev);
 		}
 
-		if (data->current_msg_idx < msg->len) {
-			LL_I3C_TransmitData8(i3c, msg->buf[data->current_msg_idx++]);
-		}
-
-		/* Reset msg_idx after moving on to the next message */
-		if (msg != data->current_i2c_msg) {
-			data->current_msg_idx = 0;
-		}
 		break;
 	}
 	case STM32_I3C_MSG_DAA: {
@@ -1285,38 +2014,15 @@ static void i3c_stm32_event_isr_rx(const struct device *dev)
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG: {
-		struct i3c_msg *msg = data->current_i3c_msg;
-
-		if (LL_I3C_IsActiveFlag_RXLAST(i3c)) {
-			data->current_i3c_msg++;
-		}
-
-		if (data->current_msg_idx < msg->len) {
-			msg->buf[data->current_msg_idx++] = LL_I3C_ReceiveData8(i3c);
-		}
-
-		/* Reset msg_idx after moving on to the next message */
-		if (msg != data->current_i3c_msg) {
-			data->current_msg_idx = 0;
-		}
-
-		break;
-	}
+	case STM32_I3C_MSG:
 	case STM32_I2C_MSG: {
-		struct i2c_msg *msg = data->current_i2c_msg;
+		uint8_t *buf = NULL;
+		size_t *offset = NULL;
+		uint32_t len = 0;
 
-		if (LL_I3C_IsActiveFlag_RXLAST(i3c)) {
-			data->current_i2c_msg++;
-		}
-
-		if (data->current_msg_idx < msg->len) {
-			msg->buf[data->current_msg_idx++] = LL_I3C_ReceiveData8(i3c);
-		}
-
-		/* Reset msg_idx after moving on to the next message */
-		if (msg != data->current_i2c_msg) {
-			data->current_msg_idx = 0;
+		i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+		if (i3c_stm32_drain_rx_fifo(dev, buf, len, offset)) {
+			i3c_stm32_curr_msg_xfer_next(dev);
 		}
 
 		break;
@@ -1359,33 +2065,18 @@ static void i3c_stm32_event_isr_cf(const struct device *dev)
 {
 	const struct i3c_stm32_config *config = dev->config;
 	struct i3c_stm32_data *data = dev->data;
+	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
 	I3C_TypeDef *i3c = config->i3c;
 
 	switch (data->msg_state) {
-	case STM32_I3C_MSG: {
-		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->current_i3c_msg_cf->len,
-			((data->current_i3c_msg_cf->flags & I3C_MSG_RW_MASK) == I3C_MSG_READ)
-				? LL_I3C_DIRECTION_READ
-				: LL_I3C_DIRECTION_WRITE,
-			LL_I3C_CONTROLLER_MTYPE_PRIVATE,
-			((data->num_msgs > 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP));
-
-		data->current_i3c_msg_cf++;
-		data->num_msgs--;
-		break;
-	}
+	case STM32_I3C_MSG:
 	case STM32_I2C_MSG: {
 		LL_I3C_ControllerHandleMessage(
-			i3c, data->target_addr, data->current_i2c_msg->len,
-			((data->current_i2c_msg_cf->flags & I2C_MSG_RW_MASK) == I2C_MSG_READ)
-				? LL_I3C_DIRECTION_READ
-				: LL_I3C_DIRECTION_WRITE,
-			LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C,
-			((data->num_msgs > 1) ? LL_I3C_GENERATE_RESTART : LL_I3C_GENERATE_STOP));
+			i3c, curr_msg->target_addr, i3c_stm32_curr_msg_control_get_len(dev),
+			i3c_stm32_curr_msg_control_get_dir(dev), curr_msg->msg_type,
+			i3c_stm32_curr_msg_control_get_end(dev));
 
-		data->current_i2c_msg_cf++;
-		data->num_msgs--;
+		i3c_stm32_curr_msg_control_next(dev);
 		break;
 	}
 	case STM32_I3C_MSG_CCC:
@@ -1444,8 +2135,10 @@ static void i3c_stm32_event_isr(void *arg)
 	if (LL_I3C_IsActiveFlag_SFNE(i3c) && LL_I3C_IsEnabledIT_SFNE(i3c)) {
 
 		if (data->msg_state == STM32_I3C_MSG) {
-			data->current_i3c_msg_sf->num_xfer = LL_I3C_GetXferDataCount(i3c);
-			data->current_i3c_msg_sf++;
+			size_t num_xfer = LL_I3C_GetXferDataCount(i3c);
+
+			i3c_stm32_curr_msg_status_update_num_xfer(dev, num_xfer);
+			i3c_stm32_curr_msg_status_next(dev);
 		} else {
 			/* Read and discard the status FIFO word since it will not be used */
 			uint32_t status_reg = i3c->SR;
@@ -1518,8 +2211,8 @@ static void i3c_stm32_event_isr(void *arg)
 
 #endif
 
-	if (LL_I3C_IsActiveFlag_WKP(I3C1)) {
-		LL_I3C_ClearFlag_WKP(I3C1);
+	if (LL_I3C_IsActiveFlag_WKP(i3c)) {
+		LL_I3C_ClearFlag_WKP(i3c);
 	}
 }
 
@@ -1532,38 +2225,7 @@ static void i3c_stm32_error_isr(void *arg)
 	struct i3c_stm32_data *data = dev->data;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (LL_I3C_IsActiveFlag_ANACK(i3c)) {
-		LOG_ERR("Address NACK");
-	}
-
-	if (LL_I3C_IsActiveFlag_COVR(i3c)) {
-		LOG_ERR("Control/Status FIFO underrun/overrun");
-	}
-
-	if (LL_I3C_IsActiveFlag_DOVR(i3c)) {
-		LOG_ERR("TX/RX FIFO underrun/overrun");
-	}
-
-	if (LL_I3C_IsActiveFlag_DNACK(i3c)) {
-		LOG_ERR("Data NACK by target");
-	}
-
-	if (LL_I3C_IsActiveFlag_PERR(i3c)) {
-		switch (LL_I3C_GetMessageErrorCode(i3c)) {
-		case LL_I3C_CONTROLLER_ERROR_CE0:
-			LOG_ERR("Illegally formatted CCC detected");
-			break;
-		case LL_I3C_CONTROLLER_ERROR_CE1:
-			LOG_ERR("Data on bus is not as expected");
-			break;
-		case LL_I3C_CONTROLLER_ERROR_CE2:
-			LOG_ERR("No response to broadcast address");
-			break;
-		default:
-			LOG_ERR("Unsupported error detected");
-			break;
-		}
-	}
+	i3c_stm32_log_err_type(dev);
 
 	LL_I3C_ClearFlag_ERR(i3c);
 
@@ -1577,7 +2239,10 @@ static void i3c_stm32_error_isr(void *arg)
 	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 }
 
+#endif /* CONFIG_I3C_STM32_POLL */
+
 #ifdef CONFIG_I3C_USE_IBI
+
 int i3c_stm32_ibi_enable(const struct device *dev, struct i3c_device_desc *target)
 {
 	int ret = 0;
@@ -1696,30 +2361,38 @@ static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, u
 				int status)
 {
 	const struct device *dev = (const struct device *)user_data;
-	struct i3c_stm32_data *data = dev->data;
 
-	if (data->msg_state == STM32_I3C_MSG) {
-		data->current_i3c_msg++;
-		i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
-	} else if (data->msg_state == STM32_I2C_MSG) {
-		data->current_i2c_msg++;
-		i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
+	if (i3c_stm32_curr_msg_xfer_next(dev) != 0) {
+		/* No more messages to transmit */
+		return;
 	}
+
+	uint8_t *buf = NULL;
+	size_t *offset = 0;
+	uint32_t len = 0;
+
+	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+	i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len, i3c_stm32_curr_msg_xfer_is_read(dev));
 }
 
 static void i3c_stm32_dma_rx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
 	const struct device *dev = (const struct device *)user_data;
-	struct i3c_stm32_data *data = dev->data;
 
-	if (data->msg_state == STM32_I3C_MSG) {
-		data->current_i3c_msg++;
-		i3c_stm32_dma_i3c_msg_config(dev, data->current_i3c_msg);
-	} else if (data->msg_state == STM32_I2C_MSG) {
-		data->current_i2c_msg++;
-		i3c_stm32_dma_i2c_msg_config(dev, data->current_i2c_msg);
+	if (i3c_stm32_curr_msg_xfer_next(dev) != 0) {
+		/* No more messages to transmit */
+		return;
 	}
+
+	uint8_t *buf = NULL;
+	size_t *offset = 0;
+	uint32_t len = 0;
+
+	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+
+	i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len, i3c_stm32_curr_msg_xfer_is_read(dev));
 }
 
 static void i3c_stm32_dma_tc_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
@@ -1742,7 +2415,7 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 	.configure = i3c_stm32_configure,
 	.config_get = i3c_stm32_config_get,
 	.i3c_device_find = i3c_stm32_device_find,
-	.i3c_xfers = i3c_stm32_transfer,
+	.i3c_xfers = i3c_stm32_i3c_transfer,
 	.do_daa = i3c_stm32_do_daa,
 	.do_ccc = i3c_stm32_do_ccc,
 #ifdef CONFIG_I3C_USE_IBI
@@ -1802,16 +2475,28 @@ static const struct i3c_driver_api i3c_stm32_driver_api = {
 		irq_enable(DT_INST_IRQ_BY_NAME(index, error, irq));                                \
 	} while (false)
 
+#ifdef CONFIG_I3C_STM32_POLL
+#define STM32_I3C_IRQ_HANDLER_DECL(index)
+#else
 #define STM32_I3C_IRQ_HANDLER_DECL(index)                                                          \
 	static void i3c_stm32_irq_config_func_##index(const struct device *dev)
+#endif
 
+#ifdef CONFIG_I3C_STM32_POLL
+#define STM32_I3C_IRQ_HANDLER_FUNCTION(index)
+#else
 #define STM32_I3C_IRQ_HANDLER_FUNCTION(index) .irq_config_func = i3c_stm32_irq_config_func_##index,
+#endif
 
+#ifdef CONFIG_I3C_STM32_POLL
+#define STM32_I3C_IRQ_HANDLER(index)
+#else
 #define STM32_I3C_IRQ_HANDLER(index)                                                               \
 	static void i3c_stm32_irq_config_func_##index(const struct device *dev)                    \
 	{                                                                                          \
 		STM32_I3C_IRQ_CONNECT_AND_ENABLE(index);                                           \
 	}
+#endif
 
 #define I3C_STM32_INIT(index)                                                                      \
 	STM32_I3C_IRQ_HANDLER_DECL(index);                                                         \

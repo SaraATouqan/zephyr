@@ -15,11 +15,19 @@ config I3C_STM32
     help
       Enable support for I3C on STM32 microcontrollers.
 
+config I3C_STM32_POLL
+    bool "Enables I3C polling mode"
+    depends on I3C_STM32
+    default n
+    help
+      Enables polling mode for I3C on STM32 microcontrollers.
+
 config I3C_STM32_DMA
     bool "STM32 I3C DMA driver support"
-    depends on I3C_STM32 && DMA_STM32U5
+    depends on I3C_STM32 && DMA_STM32U5 && !I3C_STM32_POLL
     help
       Enables support for I3C DMA mode on STM32 microcontrollers.
+      This option is incompatible with I3C_STM32_POLL
 
 config I3C_STM32_DMA_FIFO_HEAP_SIZE
     int "Status FIFO and control FIFO heap"
