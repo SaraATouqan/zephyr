@@ -89,20 +89,16 @@ struct i3c_stm32_dma_stream {
 struct i3c_stm32_msg {
 	uint8_t target_addr;         /* Current target xfer address */
 	struct i3c_msg *i3c_msg_ptr; /* Pointer to the current private message to send on the bus */
-	struct i3c_msg *i3c_msg_ctrl_ptr;   /* Pointer to the private message that will be used by
-						     the control FIFO */
-	struct i3c_msg *i3c_msg_status_ptr; /* Pointer to the private message that will be used by
-						   the status FIFO */
+	struct i3c_msg *i3c_msg_ctrl_ptr;   /* Pointer to the private message that will be used by the control FIFO */
+	struct i3c_msg *i3c_msg_status_ptr; /* Pointer to the private message that will be used by the status FIFO */
 	struct i2c_msg *i2c_msg_ptr; /* Pointer to the current legacy message to send on the bus */
-	struct i2c_msg *i2c_msg_ctrl_ptr; /* Pointer to the I2C legavy message that will be used
-						   by the control FIFO */
+	struct i2c_msg *i2c_msg_ctrl_ptr; /* Pointer to the I2C legavy message that will be used by the control FIFO */
 	size_t num_msgs;                  /* Number of messages */
 	size_t ctrl_msg_idx;              /* Current control message index */
 	size_t status_msg_idx;            /* Current status message index */
 	size_t xfer_msg_idx;              /* Current trasnfer message index */
 	size_t xfer_offset;               /* Current message transfer offset */
-	uint32_t msg_type;                /* Either LL_I3C_CONTROLLER_MTYPE_PRIVATE or
-					     LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C */
+	uint32_t msg_type;                /* Either LL_I3C_CONTROLLER_MTYPE_PRIVATE or LL_I3C_CONTROLLER_MTYPE_LEGACY_I2C */
 };
 
 struct i3c_stm32_config {
@@ -119,10 +115,9 @@ struct i3c_stm32_data {
 	enum i3c_stm32_sf_state sf_state;    /* Current I3C status FIFO state */
 	struct i3c_ccc_payload *ccc_payload; /* Current CCC message payload */
 	struct i3c_ccc_target_payload *
-		ccc_target_payload; /* Current target addressed by 2nd part of direct CCC command */
+		ccc_target_payload;              /* Current target addressed by 2nd part of direct CCC command */
 	struct i3c_ccc_target_payload
-		*ccc_target_payload_sf; /* Current target addressed by 2nd part of direct CCC
-					   command used by the status FIFO */
+		*ccc_target_payload_sf;          /* Current target addressed by 2nd part of direct CCC command used by the status FIFO */
 	size_t ccc_target_idx;          /* Current target index, used for filling C-FIFO */
 	struct k_sem device_sync_sem;   /* Sync between device communication messages */
 	struct k_sem bus_mutex;         /* Sync between transfers */
@@ -1106,6 +1101,7 @@ static int i3c_stm32_do_daa(const struct device *dev)
 		/* Read and discard status word from status FIFO since it is not used */
 		if (LL_I3C_IsActiveFlag_SFNE(i3c)) {
 			uint32_t status_reg = i3c->SR;
+
 			ARG_UNUSED(status_reg);
 		}
 
@@ -2089,6 +2085,7 @@ static void i3c_stm32_event_isr(void *arg)
 				data->ibi_payload_size, data->ibi_target_addr);
 			if ((data->ibi_payload != 0) && (data->ibi_payload_size != 0)) {
 				struct i3c_device_desc *target;
+
 				target = i3c_dev_list_i3c_addr_find(&data->drv_data.attached_dev,
 								    data->ibi_target_addr);
 
@@ -2299,13 +2296,11 @@ static void i3c_stm32_dma_rx_cb(const struct device *dma_dev, void *user_data, u
 static void i3c_stm32_dma_tc_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
-	return;
 }
 
 static void i3c_stm32_dma_rs_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
-	return;
 }
 
 #endif
