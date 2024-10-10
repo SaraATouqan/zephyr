@@ -188,18 +188,6 @@ static int i3c_stm32_curr_msg_init(const struct device *dev, struct i3c_msg *i3c
 	return 0;
 }
 
-static int i3c_stm32_curr_msg_init_i3c(const struct device *dev, struct i3c_msg *i3c_msgs,
-				       uint8_t num_msgs, uint8_t tgt_addr)
-{
-	return i3c_stm32_curr_msg_init(dev, i3c_msgs, NULL, num_msgs, tgt_addr);
-}
-
-static int i3c_stm32_curr_msg_init_i2c(const struct device *dev, struct i2c_msg *i2c_msgs,
-				       uint8_t num_msgs, uint8_t tgt_addr)
-{
-	return i3c_stm32_curr_msg_init(dev, NULL, i2c_msgs, num_msgs, tgt_addr);
-}
-
 static bool i3c_stm32_curr_msg_is_i3c(const struct device *dev)
 {
 	struct i3c_stm32_data *data = dev->data;
@@ -792,7 +780,7 @@ static void i3c_stm32_clear_err(const struct device *dev, bool is_i2c_xfer)
  *
  * @return Returns true if last byte was sent (TXLAST flag was set)
  */
-static size_t i3c_stm32_fill_tx_fifo(const struct device *dev, uint8_t *buf, size_t len,
+static bool i3c_stm32_fill_tx_fifo(const struct device *dev, uint8_t *buf, size_t len,
 				     size_t *offset)
 {
 	const struct i3c_stm32_config *config = dev->config;
@@ -830,7 +818,7 @@ static size_t i3c_stm32_fill_tx_fifo(const struct device *dev, uint8_t *buf, siz
  *
  * @return Returns true if last byte was received (RXLAST flag was set)
  */
-static size_t i3c_stm32_drain_rx_fifo(const struct device *dev, uint8_t *buf, uint32_t len,
+static bool i3c_stm32_drain_rx_fifo(const struct device *dev, uint8_t *buf, uint32_t len,
 				      size_t *offset)
 {
 	const struct i3c_stm32_config *config = dev->config;
@@ -1277,50 +1265,35 @@ static int i3c_stm32_dma_msg_status_fifo_config(const struct device *dev)
 	return 0;
 }
 
-static int i3c_stm32_dma_msg_config(const struct device *dev, uint32_t buf_addr, size_t buf_len,
-				    bool is_read)
+static int i3c_stm32_dma_msg_config(const struct device *dev, uint32_t buf_addr, size_t buf_len)
 {
+	struct i3c_stm32_dma_stream *dma_stream;
 	struct i3c_stm32_data *data = dev->data;
 	int ret;
 
-	if (is_read) {
-		data->dma_rx.blk_cfg.dest_address = buf_addr;
-		data->dma_rx.blk_cfg.block_size = buf_len;
-
-		ret = dma_config(data->dma_rx.dma_dev, data->dma_rx.dma_channel,
-				 &data->dma_rx.dma_cfg);
-
-		if (ret != 0) {
-			LOG_ERR("RX DMA config error, err=%d", ret);
-			return -EINVAL;
-		}
-
-		if (dma_start(data->dma_rx.dma_dev, data->dma_rx.dma_channel)) {
-			LOG_ERR("RX DMA start failed");
-			return -EFAULT;
-		}
-
-		return 0;
+	if (i3c_stm32_curr_msg_xfer_is_read(dev)) {
+		dma_stream =  &(data->dma_rx);
+		dma_stream->blk_cfg.dest_address = buf_addr;
+	} else {
+		dma_stream =  &(data->dma_tx);
+		dma_stream->blk_cfg.source_address = buf_addr;
 	}
 
-	data->dma_tx.blk_cfg.source_address = buf_addr;
-	data->dma_tx.blk_cfg.block_size = buf_len;
-
-	ret = dma_config(data->dma_tx.dma_dev, data->dma_tx.dma_channel, &data->dma_tx.dma_cfg);
+	dma_stream->blk_cfg.block_size = buf_len;
+	ret = dma_config(dma_stream->dma_dev, dma_stream->dma_channel,
+				&dma_stream->dma_cfg);
 
 	if (ret != 0) {
-		LOG_ERR("TX DMA config error, err=%d", ret);
+		LOG_ERR("TX/RX DMA config error, err=%d", ret);
 		return -EINVAL;
 	}
 
-	if (dma_start(data->dma_tx.dma_dev, data->dma_tx.dma_channel)) {
-		LOG_ERR("TX DMA start failed");
+	if (dma_start(dma_stream->dma_dev, dma_stream->dma_channel)) {
+		LOG_ERR("TX/RX DMA start failed");
 		return -EFAULT;
 	}
-
 	return 0;
 }
-
 #endif
 
 #ifdef CONFIG_I3C_STM32_POLL
@@ -1429,7 +1402,7 @@ static int i3c_stm32_i3c_transfer(const struct device *dev, struct i3c_device_de
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 
-	ret = i3c_stm32_curr_msg_init_i3c(dev, msgs, num_msgs, target->dynamic_addr);
+	ret = i3c_stm32_curr_msg_init(dev, msgs, NULL, num_msgs, target->dynamic_addr);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
 		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
@@ -1471,7 +1444,7 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 	k_sem_take(&data->bus_mutex, K_FOREVER);
 	LL_I3C_DisableArbitrationHeader(i3c);
 
-	ret = i3c_stm32_curr_msg_init_i2c(dev, msgs, num_msgs, addr);
+	ret = i3c_stm32_curr_msg_init(dev, NULL, msgs, num_msgs, addr);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
 		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
@@ -1502,6 +1475,13 @@ static int i3c_stm32_transfer_begin(const struct device *dev)
 	data->msg_state = STM32_I3C_MSG;
 	data->sf_state = STM32_I3C_SF;
 
+	#ifdef CONFIG_PM_DEVICE_RUNTIME
+		(void)pm_device_runtime_get(dev);
+	#endif
+
+	/* Prevent the clocks to be stopped during the transaction */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
 #ifdef CONFIG_I3C_STM32_DMA
 	struct i3c_stm32_msg *curr_msg = &data->curr_msg;
 
@@ -1530,8 +1510,7 @@ static int i3c_stm32_transfer_begin(const struct device *dev)
 
 	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
 
-	ret = i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len,
-				       i3c_stm32_curr_msg_xfer_is_read(dev));
+	ret = i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len);
 	if (ret != 0) {
 		return ret;
 	}
@@ -1548,13 +1527,6 @@ static int i3c_stm32_transfer_begin(const struct device *dev)
 
 	i3c_stm32_prepare_dma_requests(dev);
 #endif
-
-#ifdef CONFIG_PM_DEVICE_RUNTIME
-	(void)pm_device_runtime_get(dev);
-#endif
-
-	/* Prevent the clocks to be stopped during the transaction */
-	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
 	/* Begin transmission */
 	LL_I3C_RequestTransfer(i3c);
@@ -1586,7 +1558,7 @@ static int i3c_stm32_i3c_transfer(const struct device *dev, struct i3c_device_de
 	}
 
 	k_sem_take(&data->bus_mutex, K_FOREVER);
-	ret = i3c_stm32_curr_msg_init_i3c(dev, msgs, num_msgs, target->dynamic_addr);
+	ret = i3c_stm32_curr_msg_init(dev, msgs, NULL, num_msgs, target->dynamic_addr);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
 		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
@@ -1642,7 +1614,7 @@ static int i3c_stm32_i2c_transfer(const struct device *dev, struct i2c_msg *msgs
 	/* Disable arbitration header for all I2C messages in case no I3C devices exist on bus */
 	LL_I3C_DisableArbitrationHeader(i3c);
 
-	ret = i3c_stm32_curr_msg_init_i2c(dev, msgs, num_msgs, addr);
+	ret = i3c_stm32_curr_msg_init(dev, NULL, msgs, num_msgs, addr);
 	if (ret != 0) {
 		i3c_stm32_clear_err(dev, false);
 		LOG_ERR("Failed to initialize transfer messages, err=%d", ret);
@@ -1718,143 +1690,81 @@ static int i3c_stm32_pm_action(const struct device *dev, enum pm_device_action a
 #endif
 
 #ifdef CONFIG_I3C_STM32_DMA
+static int i3c_stm32_dma_stream_config(const struct device *dev,
+		struct i3c_stm32_dma_stream *dma_stream, uint64_t src_addr, uint64_t dst_addr)
+{
+	if (dma_stream->dma_dev != NULL) {
+		if (!device_is_ready(dma_stream->dma_dev)) {
+			return -ENODEV;
+		}
+	}
+
+	memset(&dma_stream->blk_cfg, 0, sizeof(dma_stream->blk_cfg));
+
+	dma_stream->blk_cfg.source_address = src_addr;
+
+	dma_stream->blk_cfg.dest_address = dst_addr;
+
+	if (dma_stream->src_addr_increment) {
+		dma_stream->blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		dma_stream->blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	if (dma_stream->dst_addr_increment) {
+		dma_stream->blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		dma_stream->blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+
+	dma_stream->blk_cfg.source_reload_en = 0;
+	dma_stream->blk_cfg.dest_reload_en = 0;
+	dma_stream->blk_cfg.fifo_mode_control = dma_stream->fifo_threshold;
+
+	dma_stream->dma_cfg.head_block = &dma_stream->blk_cfg;
+	dma_stream->dma_cfg.user_data = (void *)dev;
+
+	return 0;
+}
 
 /* Initializes the I3C DMA */
 static int i3c_stm32_init_dma(const struct device *dev)
 {
 	struct i3c_stm32_data *data = dev->data;
+	int err;
 	const struct i3c_stm32_config *config = dev->config;
 	I3C_TypeDef *i3c = config->i3c;
 
-	if (data->dma_rx.dma_dev != NULL) {
-		if (!device_is_ready(data->dma_rx.dma_dev)) {
-			return -ENODEV;
-		}
+	/*Configure DMA RX */
+	err  = i3c_stm32_dma_stream_config(dev, &data->dma_rx,
+			LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_RECEIVE_BYTE), 0);
+	if (err != 0) {
+		return err;
 	}
 
-	if (data->dma_tx.dma_dev != NULL) {
-		if (!device_is_ready(data->dma_tx.dma_dev)) {
-			return -ENODEV;
-		}
+	/*Configure DMA RS */
+	err  = i3c_stm32_dma_stream_config(dev, &data->dma_rs,
+			LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_STATUS), 0);
+	if (err != 0) {
+		return err;
 	}
 
-	if (data->dma_tc.dma_dev != NULL) {
-		if (!device_is_ready(data->dma_tc.dma_dev)) {
-			return -ENODEV;
-		}
+	/*Configure DMA TX */
+	err = i3c_stm32_dma_stream_config(dev, &data->dma_tx, 0,
+			LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_TRANSMIT_BYTE));
+	if (err != 0) {
+		return err;
 	}
 
-	if (data->dma_rs.dma_dev != NULL) {
-		if (!device_is_ready(data->dma_rs.dma_dev)) {
-			return -ENODEV;
-		}
+	/*Configure DMA TC */
+	err = i3c_stm32_dma_stream_config(dev, &data->dma_tc, 0,
+			LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_CONTROL));
+	if (err != 0) {
+		return err;
 	}
 
-	/* Configure DMA RX config */
-	memset(&data->dma_rx.blk_cfg, 0, sizeof(data->dma_rx.blk_cfg));
-
-	data->dma_rx.blk_cfg.source_address =
-		LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_RECEIVE_BYTE);
-
-	data->dma_rx.blk_cfg.dest_address = 0; /* dest not ready */
-
-	if (data->dma_rx.src_addr_increment) {
-		data->dma_rx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_rx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	if (data->dma_rx.dst_addr_increment) {
-		data->dma_rx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_rx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	data->dma_rx.blk_cfg.source_reload_en = 0;
-	data->dma_rx.blk_cfg.dest_reload_en = 0;
-	data->dma_rx.blk_cfg.fifo_mode_control = data->dma_rx.fifo_threshold;
-
-	data->dma_rx.dma_cfg.head_block = &data->dma_rx.blk_cfg;
-	data->dma_rx.dma_cfg.user_data = (void *)dev;
-
-	/* Configure DMA RS config */
-	memset(&data->dma_rs.blk_cfg, 0, sizeof(data->dma_rs.blk_cfg));
-
-	data->dma_rs.blk_cfg.source_address = LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_STATUS);
-
-	data->dma_rs.blk_cfg.dest_address = 0; /* dest not ready */
-
-	if (data->dma_rs.src_addr_increment) {
-		data->dma_rs.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_rs.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	if (data->dma_rs.dst_addr_increment) {
-		data->dma_rs.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_rs.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	data->dma_rs.blk_cfg.source_reload_en = 0;
-	data->dma_rs.blk_cfg.dest_reload_en = 0;
-	data->dma_rs.blk_cfg.fifo_mode_control = data->dma_rs.fifo_threshold;
-
-	data->dma_rs.dma_cfg.head_block = &data->dma_rs.blk_cfg;
-	data->dma_rs.dma_cfg.user_data = (void *)dev;
-
-	/* Configure DMA TX config */
-	memset(&data->dma_tx.blk_cfg, 0, sizeof(data->dma_tx.blk_cfg));
-
-	data->dma_tx.blk_cfg.dest_address =
-		LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_DATA_TRANSMIT_BYTE);
-
-	data->dma_tx.blk_cfg.source_address = 0; /* not ready */
-
-	if (data->dma_tx.src_addr_increment) {
-		data->dma_tx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_tx.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	if (data->dma_tx.dst_addr_increment) {
-		data->dma_tx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_tx.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	data->dma_tx.blk_cfg.fifo_mode_control = data->dma_tx.fifo_threshold;
-
-	data->dma_tx.dma_cfg.head_block = &data->dma_tx.blk_cfg;
-	data->dma_tx.dma_cfg.user_data = (void *)dev;
-
-	/* Configure DMA TC config */
-	memset(&data->dma_tc.blk_cfg, 0, sizeof(data->dma_tc.blk_cfg));
-
-	data->dma_tc.blk_cfg.dest_address = LL_I3C_DMA_GetRegAddr(i3c, LL_I3C_DMA_REG_CONTROL);
-
-	data->dma_tc.blk_cfg.source_address = 0; /* not ready */
-
-	if (data->dma_tc.src_addr_increment) {
-		data->dma_tc.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_tc.blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	if (data->dma_tc.dst_addr_increment) {
-		data->dma_tc.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		data->dma_tc.blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	data->dma_tc.blk_cfg.fifo_mode_control = data->dma_tc.fifo_threshold;
-
-	data->dma_tc.dma_cfg.head_block = &data->dma_tc.blk_cfg;
-	data->dma_tc.dma_cfg.user_data = (void *)dev;
-
-	return 0;
+	return err;
 }
-
 #endif
 
 /* Initializes the I3C device and I3C bus */
@@ -2356,14 +2266,13 @@ int i3c_stm32_ibi_disable(const struct device *dev, struct i3c_device_desc *targ
 #endif /* CONFIG_I3C_USE_IBI */
 
 #ifdef CONFIG_I3C_STM32_DMA
-
-static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
-				int status)
+static void i3c_stm32_tx_rx_msg_config(const struct device *dma_dev,
+		void *user_data, uint32_t channel, int status)
 {
 	const struct device *dev = (const struct device *)user_data;
 
 	if (i3c_stm32_curr_msg_xfer_next(dev) != 0) {
-		/* No more messages to transmit */
+		/* No more messages to transmit/receive */
 		return;
 	}
 
@@ -2372,27 +2281,19 @@ static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, u
 	uint32_t len = 0;
 
 	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
+	i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len);
+}
 
-	i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len, i3c_stm32_curr_msg_xfer_is_read(dev));
+static void i3c_stm32_dma_tx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
+				int status)
+{
+	i3c_stm32_tx_rx_msg_config(dma_dev, user_data, channel, status);
 }
 
 static void i3c_stm32_dma_rx_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
 				int status)
 {
-	const struct device *dev = (const struct device *)user_data;
-
-	if (i3c_stm32_curr_msg_xfer_next(dev) != 0) {
-		/* No more messages to transmit */
-		return;
-	}
-
-	uint8_t *buf = NULL;
-	size_t *offset = 0;
-	uint32_t len = 0;
-
-	i3c_stm32_curr_msg_xfer_get_buf(dev, &buf, &len, &offset);
-
-	i3c_stm32_dma_msg_config(dev, (uint32_t)buf, len, i3c_stm32_curr_msg_xfer_is_read(dev));
+	i3c_stm32_tx_rx_msg_config(dma_dev, user_data, channel, status);
 }
 
 static void i3c_stm32_dma_tc_cb(const struct device *dma_dev, void *user_data, uint32_t channel,
