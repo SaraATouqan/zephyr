@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2024
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/i3c.h>
 #include <zephyr/drivers/clock_control.h>
